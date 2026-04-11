@@ -1,0 +1,20 @@
+[Unit]
+Description=Paperclip Inbox Lark Notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABS/PATH/TO/paperclip-inbox-lark-notifier
+Environment=PAPERCLIP_INBOX_LARK_CONFIG_FILE=/ABS/PATH/TO/paperclip-inbox-lark-notifier/examples/inbox-lark-notifier.config.example.json
+Environment=PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY=pcak_replace_me
+Environment=PAPERCLIP_INBOX_LARK_APP_ID=cli_replace_me
+Environment=PAPERCLIP_INBOX_LARK_APP_SECRET=replace_me
+ExecStart=/usr/bin/env pnpm start
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

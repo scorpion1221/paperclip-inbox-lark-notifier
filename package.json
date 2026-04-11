@@ -1,0 +1,32 @@
+{
+  "name": "paperclip-inbox-lark-notifier",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone notifier that watches Paperclip inbox changes and sends Lark cards.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pino": "^9.6.0",
+    "tsx": "^4.19.2",
+    "ws": "^8.19.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}

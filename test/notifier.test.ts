@@ -1,0 +1,219 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { describe, expect, it } from "vitest";
+import type { InboxIssueSummary, LiveEvent } from "../src/notifier.js";
+import {
+  createInboxSnapshot,
+  diffAddedIssues,
+  isRelevantActivityEvent,
+  loadNotifierConfig,
+  planIssueNotifications,
+  resolveRefreshUserIds,
+  shouldNotifyForAction,
+} from "../src/notifier.js";
+
+function makeIssue(overrides: Partial<InboxIssueSummary> = {}): InboxIssueSummary {
+  return {
+    id: "issue-1",
+    identifier: "SOL-99",
+    title: "Example issue",
+    status: "todo",
+    priority: "medium",
+    updatedAt: "2026-04-11T00:00:00.000Z",
+    lastActivityAt: "2026-04-11T00:00:00.000Z",
+    isUnreadForMe: true,
+    ...overrides,
+  };
+}
+
+function makeActivityEvent(action: string, userId?: string): LiveEvent {
+  return {
+    id: 1,
+    companyId: "company-1",
+    type: "activity.logged",
+    createdAt: "2026-04-11T00:00:00.000Z",
+    payload: {
+      action,
+      entityType: "issue",
+      entityId: "issue-1",
+      details: userId ? { userId } : {},
+    },
+  };
+}
+
+describe("paperclip inbox Lark notifier helpers", () => {
+  it("filters for relevant issue activity events only", () => {
+    expect(isRelevantActivityEvent(makeActivityEvent("issue.created"))).toBe(true);
+    expect(isRelevantActivityEvent(makeActivityEvent("issue.comment_added"))).toBe(true);
+    expect(isRelevantActivityEvent(makeActivityEvent("issue.deleted"))).toBe(false);
+    expect(
+      isRelevantActivityEvent({
+        ...makeActivityEvent("issue.created"),
+        payload: {
+          action: "issue.created",
+          entityType: "project",
+          entityId: "project-1",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("targets only the affected user for local inbox actions", () => {
+    const event = makeActivityEvent("issue.inbox_archived", "user-2");
+    expect(resolveRefreshUserIds(event, ["user-1", "user-2", "user-3"])).toEqual(["user-2"]);
+  });
+
+  it("targets all configured users for shared issue activity", () => {
+    const event = makeActivityEvent("issue.comment_added", "user-2");
+    expect(resolveRefreshUserIds(event, ["user-1", "user-2"])).toEqual(["user-1", "user-2"]);
+  });
+
+  it("diffs newly visible inbox issues", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", identifier: "SOL-1" })]);
+    const nextIssues = [
+      makeIssue({ id: "issue-2", identifier: "SOL-2" }),
+      makeIssue({ id: "issue-1", identifier: "SOL-1" }),
+    ];
+
+    expect(diffAddedIssues(previous, nextIssues).map((issue) => issue.id)).toEqual(["issue-2"]);
+  });
+
+  it("suppresses notifications for local read/archive actions", () => {
+    const previous = createInboxSnapshot([]);
+    const nextIssues = [makeIssue({ id: "issue-2", identifier: "SOL-2" })];
+
+    expect(shouldNotifyForAction("issue.read_marked")).toBe(false);
+    expect(
+      planIssueNotifications({
+        action: "issue.inbox_unarchived",
+        previousSnapshot: previous,
+        nextIssues,
+      }),
+    ).toEqual([]);
+  });
+
+  it("notifies when a new inbox-visible issue appears after shared activity", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", identifier: "SOL-1" })]);
+    const nextIssues = [
+      makeIssue({ id: "issue-2", identifier: "SOL-2" }),
+      makeIssue({ id: "issue-1", identifier: "SOL-1" }),
+    ];
+
+    expect(
+      planIssueNotifications({
+        action: "issue.created",
+        previousSnapshot: previous,
+        nextIssues,
+      }).map((issue) => issue.id),
+    ).toEqual(["issue-2"]);
+  });
+
+  it("loads notifier config from a config file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "paperclip-inbox-lark-config-"));
+    const configPath = join(dir, "config.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        apiUrl: "https://paperclip.example.com",
+        companyId: "company-1",
+        agentApiKey: "pcak_test",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        destinationsByUserId: {
+          "user-1": {
+            type: "webhook",
+            webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+          },
+        },
+      }),
+    );
+
+    try {
+      const config = loadNotifierConfig({
+        PAPERCLIP_INBOX_LARK_CONFIG_FILE: configPath,
+      });
+
+      expect(config.apiUrl).toBe("https://paperclip.example.com");
+      expect(config.destinationsByUserId["user-1"]).toEqual({
+        type: "webhook",
+        webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets env values override the config file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "paperclip-inbox-lark-config-"));
+    const configPath = join(dir, "config.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        apiUrl: "https://paperclip.example.com",
+        companyId: "company-1",
+        agentApiKey: "pcak_test",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        destinationsByUserId: {
+          "user-1": {
+            type: "webhook",
+            webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+          },
+        },
+      }),
+    );
+
+    try {
+      const config = loadNotifierConfig({
+        PAPERCLIP_INBOX_LARK_CONFIG_FILE: configPath,
+        PAPERCLIP_INBOX_NOTIFIER_API_URL: "https://override.example.com",
+        PAPERCLIP_INBOX_LARK_DRY_RUN: "true",
+      });
+
+      expect(config.apiUrl).toBe("https://override.example.com");
+      expect(config.dryRun).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads destinations from a separate JSON file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "paperclip-inbox-lark-config-"));
+    const configPath = join(dir, "config.json");
+    const destinationsPath = join(dir, "destinations.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        apiUrl: "https://paperclip.example.com",
+        companyId: "company-1",
+        agentApiKey: "pcak_test",
+        paperclipBaseUrl: "https://paperclip.example.com",
+      }),
+    );
+    writeFileSync(
+      destinationsPath,
+      JSON.stringify({
+        "user-2": {
+          type: "webhook",
+          webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test-2",
+        },
+      }),
+    );
+
+    try {
+      const config = loadNotifierConfig({
+        PAPERCLIP_INBOX_LARK_CONFIG_FILE: configPath,
+        PAPERCLIP_INBOX_LARK_DESTINATIONS_FILE: destinationsPath,
+      });
+
+      expect(config.destinationsByUserId["user-2"]).toEqual({
+        type: "webhook",
+        webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test-2",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

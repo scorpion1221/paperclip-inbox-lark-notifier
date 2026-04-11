@@ -1,0 +1,23 @@
+{
+  "apiUrl": "https://paperclip.example.com",
+  "companyId": "company-uuid",
+  "paperclipBaseUrl": "https://paperclip.example.com",
+  "logLevel": "info",
+  "dryRun": false,
+  "requestTimeoutMs": 10000,
+  "reconnectBaseMs": 1000,
+  "reconnectMaxMs": 30000,
+  "deliveryRetryCount": 3,
+  "deliveryRetryBaseMs": 1000,
+  "deliveryRetryMaxMs": 8000,
+  "destinationsByUserId": {
+    "paperclip-user-id-1": {
+      "type": "webhook",
+      "webhookUrl": "https://open.feishu.cn/open-apis/bot/v2/hook/..."
+    },
+    "paperclip-user-id-2": {
+      "type": "open_id",
+      "receiveId": "ou_xxx"
+    }
+  }
+}

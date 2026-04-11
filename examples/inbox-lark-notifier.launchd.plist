@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.paperclip.inbox-lark-notifier</string>
+
+    <key>WorkingDirectory</key>
+    <string>/ABS/PATH/TO/paperclip-inbox-lark-notifier</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/env</string>
+      <string>pnpm</string>
+      <string>start</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PAPERCLIP_INBOX_LARK_CONFIG_FILE</key>
+      <string>/ABS/PATH/TO/paperclip-inbox-lark-notifier/examples/inbox-lark-notifier.config.example.json</string>
+      <key>PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY</key>
+      <string>pcak_replace_me</string>
+      <key>PAPERCLIP_INBOX_LARK_APP_ID</key>
+      <string>cli_replace_me</string>
+      <key>PAPERCLIP_INBOX_LARK_APP_SECRET</key>
+      <string>replace_me</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/paperclip-inbox-lark-notifier.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/paperclip-inbox-lark-notifier.err</string>
+  </dict>
+</plist>

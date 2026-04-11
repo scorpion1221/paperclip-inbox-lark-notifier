@@ -1,0 +1,10 @@
+{
+  "paperclip-user-id-1": {
+    "type": "webhook",
+    "webhookUrl": "https://open.feishu.cn/open-apis/bot/v2/hook/..."
+  },
+  "paperclip-user-id-2": {
+    "type": "chat_id",
+    "receiveId": "oc_xxx"
+  }
+}
