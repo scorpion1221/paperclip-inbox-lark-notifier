@@ -67,17 +67,26 @@ const receiveIdDestinationSchema = z.object({
 
 const larkDestinationSchema = z.union([webhookDestinationSchema, receiveIdDestinationSchema]);
 
-const notifierConfigBaseSchema = z.object({
-  apiUrl: z.string().url(),
+const companyConfigSchema = z.object({
   companyId: z.string().min(1),
   companyName: z.string().min(1).optional(),
   agentApiKey: z.string().min(1),
+  paperclipBaseUrl: z.string().url().optional(),
+  destinationsByUserId: z.record(z.string().min(1), larkDestinationSchema),
+});
+
+const notifierConfigBaseSchema = z.object({
+  apiUrl: z.string().url(),
+  companyId: z.string().optional().default(""),
+  companyName: z.string().min(1).optional(),
+  agentApiKey: z.string().optional().default(""),
   paperclipBaseUrl: z.string().url(),
   dryRun: z.boolean().default(false),
   logLevel: z.enum(LOG_LEVELS).default("info"),
-  destinationsByUserId: z.record(z.string().min(1), larkDestinationSchema),
+  destinationsByUserId: z.record(z.string().min(1), larkDestinationSchema).optional().default({}),
   larkAppId: z.string().min(1).optional(),
   larkAppSecret: z.string().min(1).optional(),
+  companies: z.array(companyConfigSchema).optional(),
   requestTimeoutMs: z.number().int().positive().default(10_000),
   reconnectBaseMs: z.number().int().positive().default(1_000),
   reconnectMaxMs: z.number().int().positive().default(30_000),
@@ -91,15 +100,30 @@ const notifierConfigBaseSchema = z.object({
 });
 
 const notifierConfigSchema = notifierConfigBaseSchema.superRefine((value, ctx) => {
-  if (Object.keys(value.destinationsByUserId).length === 0) {
+  const hasCompanies = value.companies && value.companies.length > 0;
+  const hasLegacy = Boolean(value.companyId) && Boolean(value.agentApiKey) && Object.keys(value.destinationsByUserId).length > 0;
+
+  if (!hasCompanies && !hasLegacy) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ["destinationsByUserId"],
-      message: "At least one Paperclip user -> Lark destination mapping is required.",
+      path: ["companies"],
+      message:
+        "Either 'companies' array must be non-empty, or legacy single-company fields (companyId, agentApiKey, destinationsByUserId) must be provided.",
     });
   }
 
-  const needsBotCredentials = Object.values(value.destinationsByUserId).some(
+  // Collect all destinations across all companies + legacy
+  const allDestinations: z.infer<typeof larkDestinationSchema>[] = [];
+  if (hasLegacy) {
+    allDestinations.push(...Object.values(value.destinationsByUserId));
+  }
+  if (value.companies) {
+    for (const company of value.companies) {
+      allDestinations.push(...Object.values(company.destinationsByUserId));
+    }
+  }
+
+  const needsBotCredentials = allDestinations.some(
     (destination) => destination.type === "open_id" || destination.type === "chat_id",
   );
 
@@ -119,8 +143,28 @@ export type InboxIssueSummary = z.infer<typeof inboxIssueSchema>;
 export type IssueCommentSummary = z.infer<typeof issueCommentSchema>;
 export type LarkDestination = z.infer<typeof larkDestinationSchema>;
 export type NotifierConfig = z.infer<typeof notifierConfigSchema>;
+export type CompanyConfig = z.infer<typeof companyConfigSchema>;
 export type InboxSnapshot = Map<string, InboxIssueSummary>;
 export type LiveEvent = z.infer<typeof liveEventSchema>;
+
+export function resolveCompanies(config: NotifierConfig): CompanyConfig[] {
+  if (config.companies && config.companies.length > 0) {
+    return config.companies.map((company) => ({
+      ...company,
+      paperclipBaseUrl: company.paperclipBaseUrl ?? config.paperclipBaseUrl,
+    }));
+  }
+
+  return [
+    {
+      companyId: config.companyId!,
+      companyName: config.companyName,
+      agentApiKey: config.agentApiKey!,
+      paperclipBaseUrl: config.paperclipBaseUrl,
+      destinationsByUserId: config.destinationsByUserId,
+    },
+  ];
+}
 
 interface RetryOptions {
   retries: number;
@@ -246,9 +290,10 @@ function parseDestinationsInput(input: unknown, label: string) {
 export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): NotifierConfig {
   const configFilePath = env.PAPERCLIP_INBOX_LARK_CONFIG_FILE?.trim();
   const destinationsFilePath = env.PAPERCLIP_INBOX_LARK_DESTINATIONS_FILE?.trim();
-  const configFromFile = configFilePath
-    ? partialNotifierConfigSchema.parse(readJsonFile(configFilePath, "PAPERCLIP_INBOX_LARK_CONFIG_FILE"))
+  const rawConfigFromFile = configFilePath
+    ? (readJsonFile(configFilePath, "PAPERCLIP_INBOX_LARK_CONFIG_FILE") as Record<string, unknown>)
     : {};
+  const configFromFile = partialNotifierConfigSchema.parse(rawConfigFromFile);
   const destinationsFromFile = destinationsFilePath
     ? parseDestinationsInput(
         readJsonFile(destinationsFilePath, "PAPERCLIP_INBOX_LARK_DESTINATIONS_FILE"),
@@ -285,6 +330,11 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
       : destinationsFromFile ??
         parseDestinationsInput(configFromFile.destinationsByUserId, "config.destinationsByUserId");
 
+  // Pass through companies from config file (not loaded from env vars)
+  const companies = isRecord(rawConfigFromFile) && Array.isArray(rawConfigFromFile.companies)
+    ? rawConfigFromFile.companies
+    : undefined;
+
   return notifierConfigSchema.parse({
     apiUrl,
     companyId,
@@ -294,6 +344,7 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
     dryRun: readEnvBoolean(env.PAPERCLIP_INBOX_LARK_DRY_RUN, configFromFile.dryRun ?? false),
     logLevel: (env.PAPERCLIP_INBOX_LARK_LOG_LEVEL?.trim() || configFromFile.logLevel || "info").toLowerCase(),
     destinationsByUserId,
+    companies,
     larkAppId:
       readFirstEnvString(env, ["PAPERCLIP_INBOX_LARK_APP_ID", "LARK_APP_ID", "FEISHU_APP_ID"]) ||
       configFromFile.larkAppId ||
@@ -971,13 +1022,6 @@ export function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContex
         content: buildCardPreview(issue),
       },
     },
-    ...(issueUrl
-      ? {
-          card_link: {
-            url: issueUrl,
-          },
-        }
-      : {}),
     header,
     body: {
       direction: "vertical",
@@ -1159,16 +1203,17 @@ class LarkDeliveryClient {
     destination: LarkDestination,
     issue: InboxIssueSummary,
     context: RefreshContext,
+    companyOverrides?: { paperclipBaseUrl?: string; companyName?: string | null },
   ) {
     const card = buildIssueCard(issue, {
       action: context.action,
-      paperclipBaseUrl: this.config.paperclipBaseUrl,
+      paperclipBaseUrl: companyOverrides?.paperclipBaseUrl ?? this.config.paperclipBaseUrl,
       replySnippet: context.replySnippet,
       userId,
       actorName: context.actorName,
       previousStatus: context.previousStatus,
       previousPriority: context.previousPriority,
-      companyName: this.config.companyName ?? null,
+      companyName: companyOverrides?.companyName ?? this.config.companyName ?? null,
     });
 
     if (this.config.dryRun) {
@@ -1285,13 +1330,10 @@ class LarkDeliveryClient {
 export class PaperclipInboxLarkNotifier {
   private readonly config: NotifierConfig;
   private readonly logger: pino.Logger;
-  private readonly snapshotsByUserId = new Map<string, InboxSnapshot>();
-  private readonly refreshChainsByUserId = new Map<string, Promise<void>>();
   private readonly deliveryClient: LarkDeliveryClient;
-  private readonly agentCache = new Map<string, string>();
 
   private stopped = false;
-  private socket: WebSocket | null = null;
+  private readonly sockets: WebSocket[] = [];
   private signalHandlersInstalled = false;
 
   constructor(config: NotifierConfig, logger = pino({ level: config.logLevel })) {
@@ -1302,64 +1344,17 @@ export class PaperclipInboxLarkNotifier {
 
   async run() {
     this.installSignalHandlers();
-    await this.fetchAgentCache();
-    await this.refreshAllUsers("bootstrap");
-    await this.connectLoop();
-  }
-
-  private async fetchAgentCache() {
-    try {
-      const endpoint = new URL(
-        `/api/companies/${encodeURIComponent(this.config.companyId)}/agents`,
-        this.config.apiUrl,
-      );
-
-      const agentListSchema = z.array(
-        z.object({
-          id: z.string(),
-          name: z.string().optional(),
-        }).passthrough(),
-      );
-
-      const agents = await fetchJson(endpoint, agentListSchema, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.config.agentApiKey}`,
-        },
-        timeoutMs: this.config.requestTimeoutMs,
-        retries: this.config.deliveryRetryCount,
-        retryBaseMs: this.config.deliveryRetryBaseMs,
-        retryMaxMs: this.config.deliveryRetryMaxMs,
-      });
-
-      for (const agent of agents) {
-        if (agent.name) {
-          this.agentCache.set(agent.id, agent.name);
-        }
-      }
-
-      this.logger.info({ agentCount: this.agentCache.size }, "loaded agent cache");
-    } catch (err) {
-      this.logger.warn({ err }, "failed to load agent cache, actor names will be unavailable");
-    }
-  }
-
-  private resolveActorName(actorType: string | null | undefined, actorId: string | null | undefined): string | null {
-    if (!actorType) return null;
-    if (actorType === "agent" && actorId) {
-      return this.agentCache.get(actorId) ?? actorId;
-    }
-    if (actorType === "user") {
-      return "用户";
-    }
-    return null;
+    const companies = resolveCompanies(this.config);
+    this.logger.info({ companyCount: companies.length, companyIds: companies.map(c => c.companyId) }, "starting notifier");
+    await Promise.all(companies.map(company => this.runCompany(company)));
   }
 
   stop() {
     this.stopped = true;
-    if (this.socket) {
-      this.socket.close();
+    for (const socket of this.sockets) {
+      socket.close();
     }
+    this.sockets.length = 0;
   }
 
   private installSignalHandlers() {
@@ -1375,334 +1370,400 @@ export class PaperclipInboxLarkNotifier {
     process.on("SIGTERM", shutdown);
   }
 
-  private async connectLoop() {
-    let attempt = 0;
+  private async runCompany(company: CompanyConfig) {
+    const companyLogger = this.logger.child({ companyId: company.companyId });
+    const snapshotsByUserId = new Map<string, InboxSnapshot>();
+    const refreshChainsByUserId = new Map<string, Promise<void>>();
+    const agentCache = new Map<string, string>();
 
-    while (!this.stopped) {
-      if (attempt > 0) {
-        const delay = Math.min(this.config.reconnectMaxMs, this.config.reconnectBaseMs * 2 ** (attempt - 1));
-        this.logger.warn({ attempt, delay }, "waiting before websocket reconnect");
-        await sleep(delay);
+    const resolveActorName = (actorType: string | null | undefined, actorId: string | null | undefined): string | null => {
+      if (!actorType) return null;
+      if (actorType === "agent" && actorId) {
+        return agentCache.get(actorId) ?? actorId;
       }
-
-      try {
-        await this.connectOnce(attempt > 0 ? "reconnect" : "initial_connect");
-        attempt = 0;
-      } catch (err) {
-        const wsStatus = readUnexpectedWebSocketStatus(err);
-        if (wsStatus === 401 || wsStatus === 403) {
-          this.logger.warn({ wsStatus, err }, "websocket auth failed, switching to polling mode");
-          await this.pollLoop();
-          return;
-        }
-
-        attempt += 1;
-        if (this.stopped) {
-          return;
-        }
-        this.logger.warn({ attempt, err }, "websocket connection ended");
+      if (actorType === "user") {
+        return "用户";
       }
-    }
-  }
-
-  private async connectOnce(connectReason: string) {
-    const wsUrl = new URL(this.config.apiUrl);
-    wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-    wsUrl.pathname = `/api/companies/${encodeURIComponent(this.config.companyId)}/events/ws`;
-    wsUrl.search = "";
-
-    await new Promise<void>((resolve, reject) => {
-      let opened = false;
-      const socket = new WebSocket(wsUrl, {
-        headers: {
-          Authorization: `Bearer ${this.config.agentApiKey}`,
-        },
-      });
-
-      this.socket = socket;
-
-      socket.on("open", () => {
-        opened = true;
-        this.logger.info({ connectReason, url: wsUrl.toString() }, "connected to live events websocket");
-        void this.refreshAllUsers(connectReason);
-      });
-
-      socket.on("message", (raw) => {
-        void this.handleSocketMessage(raw.toString());
-      });
-
-      socket.on("error", (err) => {
-        if (!opened) {
-          reject(err);
-          return;
-        }
-        this.logger.warn({ err }, "websocket client error");
-      });
-
-      socket.on("close", (code, reason) => {
-        this.socket = null;
-        const reasonText = typeof reason === "string" ? reason : reason.toString();
-        this.logger.warn({ code, reason: reasonText }, "websocket closed");
-        if (!opened) {
-          reject(new Error(`WebSocket closed before open: ${code} ${reasonText}`));
-          return;
-        }
-        resolve();
-      });
-    });
-  }
-
-  private async handleSocketMessage(raw: string) {
-    let event: LiveEvent;
-
-    try {
-      event = liveEventSchema.parse(JSON.parse(raw));
-    } catch (err) {
-      this.logger.warn({ err, raw }, "failed to parse websocket event");
-      return;
-    }
-
-    if (!isRelevantActivityEvent(event)) {
-      return;
-    }
-
-    const action = readPayloadAction(event);
-    if (!action) return;
-
-    const previous = readPayloadPrevious(event);
-    const actorType = readEventActorType(event);
-    const actorId = readEventActorId(event);
-
-    const refreshContext: RefreshContext = {
-      action,
-      issueId: readPayloadEntityId(event),
-      replySnippet: readPayloadBodySnippet(event),
-      actorType,
-      actorId,
-      actorName: this.resolveActorName(actorType, actorId),
-      previousStatus: previous ? readString(previous.status) : null,
-      previousPriority: previous ? readString(previous.priority) : null,
+      return null;
     };
 
-    const userIds = resolveRefreshUserIds(event, Object.keys(this.config.destinationsByUserId));
-    this.logger.debug({
-      eventId: event.id,
-      action,
-      userIds,
-    }, "received relevant live event");
-
-    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, refreshContext)));
-  }
-
-  private async refreshAllUsers(action: string) {
-    const userIds = Object.keys(this.config.destinationsByUserId);
-    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, { action })));
-  }
-
-  private queueUserRefresh(userId: string, context: RefreshContext) {
-    const existing = this.refreshChainsByUserId.get(userId) ?? Promise.resolve();
-    const next = existing.catch(() => undefined).then(() => this.refreshUserInbox(userId, context));
-    this.refreshChainsByUserId.set(userId, next);
-    return next;
-  }
-
-  private async pollLoop() {
-    while (!this.stopped) {
-      await sleep(this.config.pollIntervalMs);
+    const fetchAgentCache = async () => {
       try {
-        await this.refreshAllUsers("poll");
+        const endpoint = new URL(
+          `/api/companies/${encodeURIComponent(company.companyId)}/agents`,
+          this.config.apiUrl,
+        );
+
+        const agentListSchema = z.array(
+          z.object({
+            id: z.string(),
+            name: z.string().optional(),
+          }).passthrough(),
+        );
+
+        const agents = await fetchJson(endpoint, agentListSchema, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${company.agentApiKey}`,
+          },
+          timeoutMs: this.config.requestTimeoutMs,
+          retries: this.config.deliveryRetryCount,
+          retryBaseMs: this.config.deliveryRetryBaseMs,
+          retryMaxMs: this.config.deliveryRetryMaxMs,
+        });
+
+        for (const agent of agents) {
+          if (agent.name) {
+            agentCache.set(agent.id, agent.name);
+          }
+        }
+
+        companyLogger.info({ agentCount: agentCache.size }, "loaded agent cache");
       } catch (err) {
-        this.logger.warn({ err }, "poll refresh failed");
+        companyLogger.warn({ err }, "failed to load agent cache, actor names will be unavailable");
       }
-    }
-  }
+    };
 
-  private async refreshUserInbox(userId: string, context: RefreshContext) {
-    const previousSnapshot = this.snapshotsByUserId.get(userId) ?? null;
-    let nextIssues = await this.fetchMineInbox(userId);
-    let nextSnapshot = createInboxSnapshot(nextIssues);
+    const fetchMineInbox = async (userId: string) => {
+      const endpoint = new URL("/api/agents/me/inbox/mine", this.config.apiUrl);
+      endpoint.searchParams.set("userId", userId);
 
-    let additions = planIssueNotifications({
-      action: context.action,
-      previousSnapshot,
-      nextIssues,
-      targetIssueId: context.issueId,
-    });
+      return fetchJson(endpoint, inboxIssuesResponseSchema, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${company.agentApiKey}`,
+        },
+        timeoutMs: this.config.requestTimeoutMs,
+        retries: this.config.deliveryRetryCount,
+        retryBaseMs: this.config.deliveryRetryBaseMs,
+        retryMaxMs: this.config.deliveryRetryMaxMs,
+      });
+    };
 
-    if (this.shouldRetryCreatedVisibility(context, additions)) {
-      ({ nextIssues, nextSnapshot, additions } = await this.retryCreatedVisibility(userId, previousSnapshot, context));
-    }
+    const fetchLatestIssueComment = async (issueId: string) => {
+      const endpoint = new URL(`/api/issues/${issueId}/comments`, this.config.apiUrl);
+      endpoint.searchParams.set("order", "desc");
+      endpoint.searchParams.set("limit", "1");
 
-    this.snapshotsByUserId.set(userId, nextSnapshot);
+      const comments = await fetchJson(endpoint, issueCommentsResponseSchema, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${company.agentApiKey}`,
+        },
+        timeoutMs: this.config.requestTimeoutMs,
+        retries: this.config.deliveryRetryCount,
+        retryBaseMs: this.config.deliveryRetryBaseMs,
+        retryMaxMs: this.config.deliveryRetryMaxMs,
+      });
 
-    this.logger.info({
-      action: context.action,
-      targetIssueId: context.issueId,
-      userId,
-      inboxSize: nextIssues.length,
-      addedIssueIds: additions.map((issue) => issue.id),
-    }, "refreshed user inbox snapshot");
+      return comments[0] ?? null;
+    };
 
-    if (additions.length === 0) {
-      return;
-    }
+    const resolveReplySnippet = async (issue: InboxIssueSummary, context: RefreshContext) => {
+      if (context.replySnippet) {
+        return context.replySnippet;
+      }
 
-    const destination = this.config.destinationsByUserId[userId];
-    if (!destination) {
-      this.logger.warn({ userId }, "skipping delivery because no Lark destination is configured");
-      return;
-    }
+      if (context.action !== "issue.comment_added") {
+        return null;
+      }
 
-    for (const issue of additions) {
-      const notificationContext = await this.resolveNotificationContext(issue, previousSnapshot, context);
-      await this.deliveryClient.sendIssueCard(userId, destination, issue, notificationContext);
-    }
-  }
+      const latestComment = await fetchLatestIssueComment(issue.id);
+      return latestComment ? latestComment.body : null;
+    };
 
-  private async fetchMineInbox(userId: string) {
-    const endpoint = new URL("/api/agents/me/inbox/mine", this.config.apiUrl);
-    endpoint.searchParams.set("userId", userId);
+    const shouldRetryCreatedVisibility = (context: RefreshContext, additions: InboxIssueSummary[]) => {
+      return context.action === "issue.created" && Boolean(context.issueId) && additions.length === 0;
+    };
 
-    return fetchJson(endpoint, inboxIssuesResponseSchema, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${this.config.agentApiKey}`,
-      },
-      timeoutMs: this.config.requestTimeoutMs,
-      retries: this.config.deliveryRetryCount,
-      retryBaseMs: this.config.deliveryRetryBaseMs,
-      retryMaxMs: this.config.deliveryRetryMaxMs,
-    });
-  }
+    const retryCreatedVisibility = async (
+      userId: string,
+      previousSnapshot: InboxSnapshot | null,
+      context: RefreshContext,
+    ) => {
+      let nextIssues: InboxIssueSummary[] = [];
+      let nextSnapshot: InboxSnapshot = new Map();
+      let additions: InboxIssueSummary[] = [];
 
-  private async fetchLatestIssueComment(issueId: string) {
-    const endpoint = new URL(`/api/issues/${issueId}/comments`, this.config.apiUrl);
-    endpoint.searchParams.set("order", "desc");
-    endpoint.searchParams.set("limit", "1");
+      for (let attempt = 1; attempt <= this.config.createdVisibilityRetryCount; attempt += 1) {
+        const delay = Math.min(
+          this.config.createdVisibilityRetryMaxMs,
+          this.config.createdVisibilityRetryBaseMs * 2 ** (attempt - 1),
+        );
+        await sleep(delay);
+        nextIssues = await fetchMineInbox(userId);
+        nextSnapshot = createInboxSnapshot(nextIssues);
+        additions = planIssueNotifications({
+          action: context.action,
+          previousSnapshot,
+          nextIssues,
+          targetIssueId: context.issueId,
+        });
 
-    const comments = await fetchJson(endpoint, issueCommentsResponseSchema, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${this.config.agentApiKey}`,
-      },
-      timeoutMs: this.config.requestTimeoutMs,
-      retries: this.config.deliveryRetryCount,
-      retryBaseMs: this.config.deliveryRetryBaseMs,
-      retryMaxMs: this.config.deliveryRetryMaxMs,
-    });
+        companyLogger.info({
+          action: context.action,
+          issueId: context.issueId,
+          attempt,
+          delay,
+          userId,
+          inboxSize: nextIssues.length,
+          visible: context.issueId ? nextSnapshot.has(context.issueId) : false,
+        }, "retrying created issue visibility");
 
-    return comments[0] ?? null;
-  }
+        if (additions.length > 0) {
+          return { nextIssues, nextSnapshot, additions };
+        }
+      }
 
-  private async resolveReplySnippet(issue: InboxIssueSummary, context: RefreshContext) {
-    if (context.replySnippet) {
-      return context.replySnippet;
-    }
+      return { nextIssues, nextSnapshot, additions };
+    };
 
-    if (context.action !== "issue.comment_added") {
-      return null;
-    }
+    const resolveNotificationContext = async (
+      issue: InboxIssueSummary,
+      previousSnapshot: InboxSnapshot | null,
+      context: RefreshContext,
+    ): Promise<RefreshContext> => {
+      if (context.action !== "poll") {
+        return {
+          ...context,
+          issueId: context.issueId ?? issue.id,
+          replySnippet: await resolveReplySnippet(issue, context),
+        };
+      }
 
-    const latestComment = await this.fetchLatestIssueComment(issue.id);
-    return latestComment ? latestComment.body : null;
-  }
+      const previousIssue = previousSnapshot?.get(issue.id) ?? null;
+      if (!previousIssue) {
+        return {
+          action: "issue.created",
+          issueId: issue.id,
+          actorType: context.actorType,
+          actorId: context.actorId,
+          actorName: context.actorName,
+        };
+      }
 
-  private shouldRetryCreatedVisibility(context: RefreshContext, additions: InboxIssueSummary[]) {
-    return context.action === "issue.created" && Boolean(context.issueId) && additions.length === 0;
-  }
+      if (
+        previousIssue.status !== issue.status ||
+        previousIssue.priority !== issue.priority ||
+        previousIssue.title !== issue.title
+      ) {
+        return {
+          action: "issue.updated",
+          issueId: issue.id,
+          actorType: context.actorType,
+          actorId: context.actorId,
+          actorName: context.actorName,
+          previousStatus: previousIssue.status !== issue.status ? previousIssue.status : null,
+          previousPriority: previousIssue.priority !== issue.priority ? previousIssue.priority : null,
+        };
+      }
 
-  private async retryCreatedVisibility(
-    userId: string,
-    previousSnapshot: InboxSnapshot | null,
-    context: RefreshContext,
-  ) {
-    let nextIssues: InboxIssueSummary[] = [];
-    let nextSnapshot: InboxSnapshot = new Map();
-    let additions: InboxIssueSummary[] = [];
+      return {
+        action: "issue.comment_added",
+        issueId: issue.id,
+        actorType: context.actorType,
+        actorId: context.actorId,
+        actorName: context.actorName,
+        replySnippet: await resolveReplySnippet(issue, {
+          ...context,
+          action: "issue.comment_added",
+        }),
+      };
+    };
 
-    for (let attempt = 1; attempt <= this.config.createdVisibilityRetryCount; attempt += 1) {
-      const delay = Math.min(
-        this.config.createdVisibilityRetryMaxMs,
-        this.config.createdVisibilityRetryBaseMs * 2 ** (attempt - 1),
-      );
-      await sleep(delay);
-      nextIssues = await this.fetchMineInbox(userId);
-      nextSnapshot = createInboxSnapshot(nextIssues);
-      additions = planIssueNotifications({
+    const companyPaperclipBaseUrl = company.paperclipBaseUrl ?? this.config.paperclipBaseUrl;
+
+    const refreshUserInbox = async (userId: string, context: RefreshContext) => {
+      const previousSnapshot = snapshotsByUserId.get(userId) ?? null;
+      let nextIssues = await fetchMineInbox(userId);
+      let nextSnapshot = createInboxSnapshot(nextIssues);
+
+      let additions = planIssueNotifications({
         action: context.action,
         previousSnapshot,
         nextIssues,
         targetIssueId: context.issueId,
       });
 
-      this.logger.info({
+      if (shouldRetryCreatedVisibility(context, additions)) {
+        ({ nextIssues, nextSnapshot, additions } = await retryCreatedVisibility(userId, previousSnapshot, context));
+      }
+
+      snapshotsByUserId.set(userId, nextSnapshot);
+
+      companyLogger.info({
         action: context.action,
-        issueId: context.issueId,
-        attempt,
-        delay,
+        targetIssueId: context.issueId,
         userId,
         inboxSize: nextIssues.length,
-        visible: context.issueId ? nextSnapshot.has(context.issueId) : false,
-      }, "retrying created issue visibility");
+        addedIssueIds: additions.map((issue) => issue.id),
+      }, "refreshed user inbox snapshot");
 
-      if (additions.length > 0) {
-        return { nextIssues, nextSnapshot, additions };
+      if (additions.length === 0) {
+        return;
       }
-    }
 
-    return { nextIssues, nextSnapshot, additions };
-  }
+      const destination = company.destinationsByUserId[userId];
+      if (!destination) {
+        companyLogger.warn({ userId }, "skipping delivery because no Lark destination is configured");
+        return;
+      }
 
-  private async resolveNotificationContext(
-    issue: InboxIssueSummary,
-    previousSnapshot: InboxSnapshot | null,
-    context: RefreshContext,
-  ): Promise<RefreshContext> {
-    if (context.action !== "poll") {
-      return {
-        ...context,
-        issueId: context.issueId ?? issue.id,
-        replySnippet: await this.resolveReplySnippet(issue, context),
-      };
-    }
-
-    const previousIssue = previousSnapshot?.get(issue.id) ?? null;
-    if (!previousIssue) {
-      return {
-        action: "issue.created",
-        issueId: issue.id,
-        actorType: context.actorType,
-        actorId: context.actorId,
-        actorName: context.actorName,
-      };
-    }
-
-    if (
-      previousIssue.status !== issue.status ||
-      previousIssue.priority !== issue.priority ||
-      previousIssue.title !== issue.title
-    ) {
-      return {
-        action: "issue.updated",
-        issueId: issue.id,
-        actorType: context.actorType,
-        actorId: context.actorId,
-        actorName: context.actorName,
-        previousStatus: previousIssue.status !== issue.status ? previousIssue.status : null,
-        previousPriority: previousIssue.priority !== issue.priority ? previousIssue.priority : null,
-      };
-    }
-
-    return {
-      action: "issue.comment_added",
-      issueId: issue.id,
-      actorType: context.actorType,
-      actorId: context.actorId,
-      actorName: context.actorName,
-      replySnippet: await this.resolveReplySnippet(issue, {
-        ...context,
-        action: "issue.comment_added",
-      }),
+      for (const issue of additions) {
+        const notificationContext = await resolveNotificationContext(issue, previousSnapshot, context);
+        await this.deliveryClient.sendIssueCard(userId, destination, issue, notificationContext, {
+          paperclipBaseUrl: companyPaperclipBaseUrl,
+          companyName: company.companyName,
+        });
+      }
     };
+
+    const queueUserRefresh = (userId: string, context: RefreshContext) => {
+      const existing = refreshChainsByUserId.get(userId) ?? Promise.resolve();
+      const next = existing.catch(() => undefined).then(() => refreshUserInbox(userId, context));
+      refreshChainsByUserId.set(userId, next);
+      return next;
+    };
+
+    const refreshAllUsers = async (action: string) => {
+      const userIds = Object.keys(company.destinationsByUserId);
+      await Promise.all(userIds.map((userId) => queueUserRefresh(userId, { action })));
+    };
+
+    const handleSocketMessage = async (raw: string) => {
+      let event: LiveEvent;
+
+      try {
+        event = liveEventSchema.parse(JSON.parse(raw));
+      } catch (err) {
+        companyLogger.warn({ err, raw }, "failed to parse websocket event");
+        return;
+      }
+
+      if (!isRelevantActivityEvent(event)) {
+        return;
+      }
+
+      const action = readPayloadAction(event);
+      if (!action) return;
+
+      const previous = readPayloadPrevious(event);
+      const actorType = readEventActorType(event);
+      const actorId = readEventActorId(event);
+
+      const refreshContext: RefreshContext = {
+        action,
+        issueId: readPayloadEntityId(event),
+        replySnippet: readPayloadBodySnippet(event),
+        actorType,
+        actorId,
+        actorName: resolveActorName(actorType, actorId),
+        previousStatus: previous ? readString(previous.status) : null,
+        previousPriority: previous ? readString(previous.priority) : null,
+      };
+
+      const userIds = resolveRefreshUserIds(event, Object.keys(company.destinationsByUserId));
+      companyLogger.debug({
+        eventId: event.id,
+        action,
+        userIds,
+      }, "received relevant live event");
+
+      await Promise.all(userIds.map((userId) => queueUserRefresh(userId, refreshContext)));
+    };
+
+    const connectOnce = async (connectReason: string) => {
+      const wsUrl = new URL(this.config.apiUrl);
+      wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl.pathname = `/api/companies/${encodeURIComponent(company.companyId)}/events/ws`;
+      wsUrl.search = "";
+
+      await new Promise<void>((resolve, reject) => {
+        let opened = false;
+        const socket = new WebSocket(wsUrl, {
+          headers: {
+            Authorization: `Bearer ${company.agentApiKey}`,
+          },
+        });
+
+        this.sockets.push(socket);
+
+        socket.on("open", () => {
+          opened = true;
+          companyLogger.info({ connectReason, url: wsUrl.toString() }, "connected to live events websocket");
+          void refreshAllUsers(connectReason);
+        });
+
+        socket.on("message", (raw) => {
+          void handleSocketMessage(raw.toString());
+        });
+
+        socket.on("error", (err) => {
+          if (!opened) {
+            reject(err);
+            return;
+          }
+          companyLogger.warn({ err }, "websocket client error");
+        });
+
+        socket.on("close", (code, reason) => {
+          const idx = this.sockets.indexOf(socket);
+          if (idx >= 0) this.sockets.splice(idx, 1);
+          const reasonText = typeof reason === "string" ? reason : reason.toString();
+          companyLogger.warn({ code, reason: reasonText }, "websocket closed");
+          if (!opened) {
+            reject(new Error(`WebSocket closed before open: ${code} ${reasonText}`));
+            return;
+          }
+          resolve();
+        });
+      });
+    };
+
+    const pollLoop = async () => {
+      while (!this.stopped) {
+        await sleep(this.config.pollIntervalMs);
+        try {
+          await refreshAllUsers("poll");
+        } catch (err) {
+          companyLogger.warn({ err }, "poll refresh failed");
+        }
+      }
+    };
+
+    const connectLoop = async () => {
+      let attempt = 0;
+
+      while (!this.stopped) {
+        if (attempt > 0) {
+          const delay = Math.min(this.config.reconnectMaxMs, this.config.reconnectBaseMs * 2 ** (attempt - 1));
+          companyLogger.warn({ attempt, delay }, "waiting before websocket reconnect");
+          await sleep(delay);
+        }
+
+        try {
+          await connectOnce(attempt > 0 ? "reconnect" : "initial_connect");
+          attempt = 0;
+        } catch (err) {
+          const wsStatus = readUnexpectedWebSocketStatus(err);
+          if (wsStatus === 401 || wsStatus === 403) {
+            companyLogger.warn({ wsStatus, err }, "websocket auth failed, switching to polling mode");
+            await pollLoop();
+            return;
+          }
+
+          attempt += 1;
+          if (this.stopped) {
+            return;
+          }
+          companyLogger.warn({ attempt, err }, "websocket connection ended");
+        }
+      }
+    };
+
+    // --- Company runner entry point ---
+    await fetchAgentCache();
+    await refreshAllUsers("bootstrap");
+    await connectLoop();
   }
 }

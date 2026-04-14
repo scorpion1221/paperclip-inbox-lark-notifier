@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import type { InboxIssueSummary, LiveEvent } from "../src/notifier.js";
+import type { InboxIssueSummary, LiveEvent, NotifierConfig } from "../src/notifier.js";
 import {
   buildIssueCard,
   createInboxSnapshot,
@@ -11,6 +11,7 @@ import {
   isRelevantActivityEvent,
   loadNotifierConfig,
   planIssueNotifications,
+  resolveCompanies,
   resolveRefreshUserIds,
   shouldNotifyForAction,
 } from "../src/notifier.js";
@@ -357,5 +358,150 @@ describe("paperclip inbox Lark notifier helpers", () => {
 
     expect(config.larkAppId).toBe("cli_feishu");
     expect(config.larkAppSecret).toBe("secret_feishu");
+  });
+
+  it("does not include card_link in built cards", () => {
+    const card = buildIssueCard(
+      makeIssue({ identifier: "SOL-10", status: "todo", priority: "medium" }),
+      {
+        action: "issue.created",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        userId: "user-1",
+      },
+    );
+
+    expect(card).not.toHaveProperty("card_link");
+  });
+
+  it("resolveCompanies returns single company from legacy config", () => {
+    const config: NotifierConfig = {
+      apiUrl: "https://paperclip.example.com",
+      companyId: "company-1",
+      companyName: "TestCo",
+      agentApiKey: "pcak_test",
+      paperclipBaseUrl: "https://paperclip.example.com",
+      dryRun: false,
+      logLevel: "info",
+      destinationsByUserId: {
+        "user-1": { type: "webhook", webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test" },
+      },
+      requestTimeoutMs: 10_000,
+      reconnectBaseMs: 1_000,
+      reconnectMaxMs: 30_000,
+      deliveryRetryCount: 3,
+      deliveryRetryBaseMs: 1_000,
+      deliveryRetryMaxMs: 8_000,
+      pollIntervalMs: 30_000,
+      createdVisibilityRetryCount: 6,
+      createdVisibilityRetryBaseMs: 500,
+      createdVisibilityRetryMaxMs: 4_000,
+    };
+
+    const companies = resolveCompanies(config);
+    expect(companies).toHaveLength(1);
+    expect(companies[0]!.companyId).toBe("company-1");
+    expect(companies[0]!.companyName).toBe("TestCo");
+    expect(companies[0]!.agentApiKey).toBe("pcak_test");
+    expect(companies[0]!.paperclipBaseUrl).toBe("https://paperclip.example.com");
+    expect(companies[0]!.destinationsByUserId).toEqual(config.destinationsByUserId);
+  });
+
+  it("resolveCompanies returns multiple companies from multi-company config", () => {
+    const config: NotifierConfig = {
+      apiUrl: "https://paperclip.example.com",
+      companyId: "",
+      agentApiKey: "",
+      paperclipBaseUrl: "https://paperclip.example.com",
+      dryRun: false,
+      logLevel: "info",
+      destinationsByUserId: {},
+      companies: [
+        {
+          companyId: "company-a",
+          companyName: "Company A",
+          agentApiKey: "pcak_a",
+          destinationsByUserId: {
+            "user-1": { type: "webhook", webhookUrl: "https://hook.example.com/a" },
+          },
+        },
+        {
+          companyId: "company-b",
+          companyName: "Company B",
+          agentApiKey: "pcak_b",
+          paperclipBaseUrl: "https://other.example.com",
+          destinationsByUserId: {
+            "user-2": { type: "webhook", webhookUrl: "https://hook.example.com/b" },
+          },
+        },
+      ],
+      requestTimeoutMs: 10_000,
+      reconnectBaseMs: 1_000,
+      reconnectMaxMs: 30_000,
+      deliveryRetryCount: 3,
+      deliveryRetryBaseMs: 1_000,
+      deliveryRetryMaxMs: 8_000,
+      pollIntervalMs: 30_000,
+      createdVisibilityRetryCount: 6,
+      createdVisibilityRetryBaseMs: 500,
+      createdVisibilityRetryMaxMs: 4_000,
+    };
+
+    const companies = resolveCompanies(config);
+    expect(companies).toHaveLength(2);
+    expect(companies[0]!.companyId).toBe("company-a");
+    expect(companies[0]!.paperclipBaseUrl).toBe("https://paperclip.example.com"); // falls back to top-level
+    expect(companies[1]!.companyId).toBe("company-b");
+    expect(companies[1]!.paperclipBaseUrl).toBe("https://other.example.com"); // company-level override
+  });
+
+  it("loads multi-company config from a config file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "paperclip-inbox-lark-config-"));
+    const configPath = join(dir, "config.json");
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        apiUrl: "https://paperclip.example.com",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        companies: [
+          {
+            companyId: "company-a",
+            companyName: "Company A",
+            agentApiKey: "pcak_a",
+            destinationsByUserId: {
+              "user-1": {
+                type: "webhook",
+                webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test-a",
+              },
+            },
+          },
+          {
+            companyId: "company-b",
+            agentApiKey: "pcak_b",
+            destinationsByUserId: {
+              "user-2": {
+                type: "webhook",
+                webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/test-b",
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    try {
+      const config = loadNotifierConfig({
+        PAPERCLIP_INBOX_LARK_CONFIG_FILE: configPath,
+      });
+
+      expect(config.companies).toHaveLength(2);
+      expect(config.companies![0]!.companyId).toBe("company-a");
+      expect(config.companies![1]!.companyId).toBe("company-b");
+
+      const companies = resolveCompanies(config);
+      expect(companies).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
