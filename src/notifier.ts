@@ -42,6 +42,8 @@ const liveEventSchema = z.object({
   type: z.string(),
   createdAt: z.string(),
   payload: z.record(z.unknown()),
+  actorType: z.string().optional(),
+  actorId: z.string().optional(),
 });
 
 const issueCommentSchema = z.object({
@@ -68,6 +70,7 @@ const larkDestinationSchema = z.union([webhookDestinationSchema, receiveIdDestin
 const notifierConfigBaseSchema = z.object({
   apiUrl: z.string().url(),
   companyId: z.string().min(1),
+  companyName: z.string().min(1).optional(),
   agentApiKey: z.string().min(1),
   paperclipBaseUrl: z.string().url(),
   dryRun: z.boolean().default(false),
@@ -138,12 +141,21 @@ interface LarkCardContext {
   paperclipBaseUrl: string;
   replySnippet?: string | null;
   userId: string;
+  actorName?: string | null;
+  previousStatus?: string | null;
+  previousPriority?: string | null;
+  companyName?: string | null;
 }
 
 interface RefreshContext {
   action: string;
   issueId?: string | null;
   replySnippet?: string | null;
+  actorType?: string | null;
+  actorId?: string | null;
+  actorName?: string | null;
+  previousStatus?: string | null;
+  previousPriority?: string | null;
 }
 
 type LarkHeaderTemplate =
@@ -254,6 +266,10 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
     configFromFile.companyId ||
     env.PAPERCLIP_COMPANY_ID?.trim() ||
     "";
+  const companyName =
+    env.PAPERCLIP_INBOX_NOTIFIER_COMPANY_NAME?.trim() ||
+    configFromFile.companyName ||
+    undefined;
   const agentApiKey =
     env.PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY?.trim() ||
     configFromFile.agentApiKey ||
@@ -272,6 +288,7 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
   return notifierConfigSchema.parse({
     apiUrl,
     companyId,
+    companyName,
     agentApiKey,
     paperclipBaseUrl,
     dryRun: readEnvBoolean(env.PAPERCLIP_INBOX_LARK_DRY_RUN, configFromFile.dryRun ?? false),
@@ -352,6 +369,25 @@ function readPayloadUserId(event: LiveEvent) {
 function readPayloadBodySnippet(event: LiveEvent) {
   const details = isRecord(event.payload.details) ? event.payload.details : null;
   return details ? readString(details.bodySnippet) : null;
+}
+
+function readEventActorType(event: LiveEvent) {
+  return readString(event.actorType);
+}
+
+function readEventActorId(event: LiveEvent) {
+  return readString(event.actorId);
+}
+
+function readPayloadPrevious(event: LiveEvent): Record<string, unknown> | null {
+  const details = isRecord(event.payload.details) ? event.payload.details : null;
+  if (!details) return null;
+  return isRecord(details._previous) ? details._previous : null;
+}
+
+function readPayloadIdentifier(event: LiveEvent): string | null {
+  const details = isRecord(event.payload.details) ? event.payload.details : null;
+  return details ? readString(details.identifier) : null;
 }
 
 export function isRelevantActivityEvent(event: LiveEvent) {
@@ -558,31 +594,25 @@ function resolveHeaderTemplate(action: string, status: string): LarkHeaderTempla
 
   const normalized = status.trim().toLowerCase();
 
-  if (["done", "completed", "complete", "pass", "passed", "approved", "success"].includes(normalized)) {
-    return "green";
+  switch (normalized) {
+    case "backlog":
+      return "grey";
+    case "todo":
+      return "blue";
+    case "in_progress":
+      return "orange";
+    case "in_review":
+      return "purple";
+    case "done":
+      return "green";
+    case "cancelled":
+    case "canceled":
+      return "grey";
+    case "blocked":
+      return "red";
+    default:
+      return "blue";
   }
-
-  if (["blocked", "failed", "failure", "error", "rejected"].includes(normalized)) {
-    return "red";
-  }
-
-  if (["in_progress"].includes(normalized)) {
-    return "turquoise";
-  }
-
-  if (["warning", "warn"].includes(normalized)) {
-    return "orange";
-  }
-
-  if (["cancelled", "canceled"].includes(normalized)) {
-    return "grey";
-  }
-
-  if (["in_review", "review"].includes(normalized)) {
-    return "indigo";
-  }
-
-  return "blue";
 }
 
 function resolveActionEmoji(action: string): string {
@@ -600,13 +630,25 @@ function resolveActionEmoji(action: string): string {
 
 function resolveStatusTagColor(status: string): string {
   const normalized = status.trim().toLowerCase();
-  if (["done", "completed", "complete"].includes(normalized)) return "green";
-  if (["in_progress"].includes(normalized)) return "turquoise";
-  if (["in_review", "review"].includes(normalized)) return "purple";
-  if (["blocked", "failed"].includes(normalized)) return "red";
-  if (["cancelled", "canceled"].includes(normalized)) return "neutral";
-  if (["todo"].includes(normalized)) return "blue";
-  return "neutral";
+  switch (normalized) {
+    case "backlog":
+      return "neutral";
+    case "todo":
+      return "blue";
+    case "in_progress":
+      return "orange";
+    case "in_review":
+      return "purple";
+    case "done":
+      return "green";
+    case "cancelled":
+    case "canceled":
+      return "neutral";
+    case "blocked":
+      return "red";
+    default:
+      return "neutral";
+  }
 }
 
 function resolvePriorityTagColor(priority: string): string {
@@ -627,27 +669,51 @@ function buildCardPreview(issue: InboxIssueSummary) {
   return parts.join(" · ").slice(0, 120);
 }
 
+function escapeFeishuIdentifier(value: string) {
+  return value.replace(/[.\-]/g, "\\$&");
+}
+
+function resolveActionTitle(action: string): string {
+  switch (action) {
+    case "issue.created":
+      return "🆕 新 Issue 提醒";
+    case "issue.updated":
+      return "✏️ Issue 状态更新提醒";
+    case "issue.comment_added":
+      return "💬 Issue 评论提醒";
+    default:
+      return "📋 Issue 更新提醒";
+  }
+}
+
+function buildSubtitleMarkdown(companyName: string | null | undefined, identifier: string | null) {
+  const escapedId = identifier ? escapeFeishuIdentifier(identifier) : null;
+  if (companyName && escapedId) {
+    return `<font color='grey'>${escapeFeishuIdentifier(companyName)} · ${escapedId}</font>`;
+  }
+  if (escapedId) {
+    return `<font color='grey'>${escapedId}</font>`;
+  }
+  return null;
+}
+
+function buildMultiUrl(url: string) {
+  return { url, pc_url: url, ios_url: url, android_url: url };
+}
+
 export function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContext) {
   const issueUrl = buildIssueUrl(context.paperclipBaseUrl, issue);
   const issueTitle = normalizeCardText(issue.title) || "Untitled issue";
-  const recentActivity = formatTimestamp(issue.lastActivityAt ?? issue.updatedAt);
   const statusLabel = humanizeStatus(issue.status);
   const priorityLabel = humanizePriority(issue.priority);
-  const actionLabel = humanizeAction(context.action);
-  const replySnippet = truncateCardText(context.replySnippet);
   const identifierText = issue.identifier ? normalizeCardText(issue.identifier) : null;
 
   // --- Header ---
-  const emoji = resolveActionEmoji(context.action);
-  const headerTitle = identifierText
-    ? `${emoji} ${identifierText} · ${actionLabel}`
-    : `${emoji} ${actionLabel}`;
-
   const header = {
     template: resolveHeaderTemplate(context.action, issue.status),
     title: {
       tag: "plain_text",
-      content: headerTitle,
+      content: resolveActionTitle(context.action),
     },
     text_tag_list: [
       {
@@ -667,83 +733,232 @@ export function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContex
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const elements: any[] = [];
 
-  // 1. Issue title as main content
-  elements.push({
-    tag: "markdown",
-    element_id: "title",
-    content: `**${escapeMarkdownText(issueTitle)}**`,
-    text_size: "heading",
-  });
-
-  // 2. Reply snippet for comment_added (quote-style)
-  if (replySnippet) {
+  // Subtitle notation line (company · identifier + optional label)
+  const subtitleBase = buildSubtitleMarkdown(context.companyName, identifierText);
+  if (subtitleBase) {
+    let subtitleContent = subtitleBase;
+    if (context.action === "issue.updated") {
+      subtitleContent += "  **状态变更**";
+    } else if (context.action === "issue.comment_added") {
+      subtitleContent += "  **新增评论**";
+    }
     elements.push({
       tag: "markdown",
-      element_id: "reply",
-      content: `💬 ${escapeMarkdownText(replySnippet)}`,
-      text_size: "normal",
+      element_id: "subtitle",
+      content: subtitleContent,
+      text_size: "notation",
     });
   }
 
-  // 3. Metadata row — column_set with status/priority/time
+  // Issue title as heading with link
+  const titleContent = issueUrl
+    ? `**[${escapeMarkdownText(issueTitle)}](${issueUrl})**`
+    : `**${escapeMarkdownText(issueTitle)}**`;
   elements.push({
-    tag: "column_set",
-    element_id: "meta_row",
-    flex_mode: "flow",
-    horizontal_spacing: "default",
-    columns: [
-      {
-        tag: "column",
-        width: "auto",
-        elements: [
-          {
-            tag: "markdown",
-            content: `<font color='grey'>状态</font>\n${inlineCode(statusLabel)}`,
-            text_size: "notation",
-          },
-        ],
-      },
-      {
-        tag: "column",
-        width: "auto",
-        elements: [
-          {
-            tag: "markdown",
-            content: `<font color='grey'>优先级</font>\n${inlineCode(priorityLabel)}`,
-            text_size: "notation",
-          },
-        ],
-      },
-      {
-        tag: "column",
-        width: "auto",
-        elements: [
-          {
-            tag: "markdown",
-            content: `<font color='grey'>最近活动</font>\n${inlineCode(recentActivity)}`,
-            text_size: "notation",
-          },
-        ],
-      },
-    ],
+    tag: "markdown",
+    element_id: "title",
+    content: titleContent,
+    text_size: "heading",
   });
 
-  // 4. Divider + link button
-  if (issueUrl) {
-    elements.push({ tag: "hr", element_id: "divider" });
-    elements.push({
-      tag: "button",
-      element_id: "open_btn",
-      text: { tag: "plain_text", content: "在 Paperclip 中打开 →" },
-      type: "primary",
-      width: "default",
-      multi_url: {
-        url: issueUrl,
-        pc_url: issueUrl,
-        ios_url: issueUrl,
-        android_url: issueUrl,
-      },
-    });
+  // ---- Template A: issue.created ----
+  if (context.action === "issue.created") {
+    if (context.actorName) {
+      elements.push({
+        tag: "column_set",
+        element_id: "meta_row",
+        flex_mode: "flow",
+        horizontal_spacing: "default",
+        columns: [
+          {
+            tag: "column",
+            width: "auto",
+            elements: [
+              {
+                tag: "markdown",
+                content: `操作人: **${escapeMarkdownText(context.actorName)}**`,
+                text_size: "normal",
+              },
+            ],
+          },
+        ],
+      });
+    }
+
+    if (issueUrl) {
+      elements.push({ tag: "hr", element_id: "divider" });
+      elements.push({
+        tag: "button",
+        element_id: "open_btn",
+        text: { tag: "plain_text", content: "查看详情" },
+        type: "primary",
+        width: "default",
+        multi_url: buildMultiUrl(issueUrl),
+      });
+    }
+  }
+
+  // ---- Template B: issue.updated ----
+  else if (context.action === "issue.updated") {
+    const metaColumns: any[] = [];
+
+    if (context.actorName) {
+      metaColumns.push({
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "markdown",
+            content: `操作人: **${escapeMarkdownText(context.actorName)}**`,
+            text_size: "normal",
+          },
+        ],
+      });
+    }
+
+    if (context.previousStatus && context.previousStatus !== issue.status) {
+      const prevLabel = humanizeStatus(context.previousStatus);
+      metaColumns.push({
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "markdown",
+            content: `状态: ${prevLabel} → **${statusLabel}**`,
+            text_size: "normal",
+          },
+        ],
+      });
+    }
+
+    if (context.previousPriority && context.previousPriority !== issue.priority) {
+      const prevLabel = humanizePriority(context.previousPriority);
+      metaColumns.push({
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "markdown",
+            content: `优先级: ${prevLabel} → **${priorityLabel}**`,
+            text_size: "normal",
+          },
+        ],
+      });
+    }
+
+    if (metaColumns.length > 0) {
+      elements.push({
+        tag: "column_set",
+        element_id: "meta_row",
+        flex_mode: "flow",
+        horizontal_spacing: "default",
+        columns: metaColumns,
+      });
+    }
+
+    if (issueUrl) {
+      elements.push({ tag: "hr", element_id: "divider" });
+      elements.push({
+        tag: "button",
+        element_id: "open_btn",
+        text: { tag: "plain_text", content: "查看详情" },
+        type: "primary",
+        width: "default",
+        multi_url: buildMultiUrl(issueUrl),
+      });
+    }
+  }
+
+  // ---- Template C: issue.comment_added ----
+  else if (context.action === "issue.comment_added") {
+    if (context.actorName) {
+      elements.push({
+        tag: "column_set",
+        element_id: "meta_row",
+        flex_mode: "flow",
+        horizontal_spacing: "default",
+        columns: [
+          {
+            tag: "column",
+            width: "auto",
+            elements: [
+              {
+                tag: "markdown",
+                content: `操作人: **${escapeMarkdownText(context.actorName)}**`,
+                text_size: "normal",
+              },
+            ],
+          },
+        ],
+      });
+    }
+
+    const replySnippet = truncateCardText(context.replySnippet);
+    if (replySnippet) {
+      elements.push({
+        tag: "markdown",
+        element_id: "reply",
+        content: `<font color='grey'>评论内容</font>\n${escapeMarkdownText(replySnippet)}`,
+        text_size: "normal",
+      });
+    }
+
+    if (issueUrl) {
+      elements.push({ tag: "hr", element_id: "divider" });
+      elements.push({
+        tag: "column_set",
+        element_id: "action_row",
+        flex_mode: "none",
+        horizontal_spacing: "default",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              {
+                tag: "button",
+                element_id: "open_btn",
+                text: { tag: "plain_text", content: "查看详情" },
+                type: "default",
+                width: "fill",
+                multi_url: buildMultiUrl(issueUrl),
+              },
+            ],
+          },
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              {
+                tag: "button",
+                element_id: "reply_btn",
+                text: { tag: "plain_text", content: "回复评论" },
+                type: "primary",
+                width: "fill",
+                multi_url: buildMultiUrl(issueUrl),
+              },
+            ],
+          },
+        ],
+      });
+    }
+  }
+
+  // ---- Fallback for other actions ----
+  else {
+    if (issueUrl) {
+      elements.push({ tag: "hr", element_id: "divider" });
+      elements.push({
+        tag: "button",
+        element_id: "open_btn",
+        text: { tag: "plain_text", content: "查看详情" },
+        type: "primary",
+        width: "default",
+        multi_url: buildMultiUrl(issueUrl),
+      });
+    }
   }
 
   return {
@@ -950,6 +1165,10 @@ class LarkDeliveryClient {
       paperclipBaseUrl: this.config.paperclipBaseUrl,
       replySnippet: context.replySnippet,
       userId,
+      actorName: context.actorName,
+      previousStatus: context.previousStatus,
+      previousPriority: context.previousPriority,
+      companyName: this.config.companyName ?? null,
     });
 
     if (this.config.dryRun) {
@@ -1069,6 +1288,7 @@ export class PaperclipInboxLarkNotifier {
   private readonly snapshotsByUserId = new Map<string, InboxSnapshot>();
   private readonly refreshChainsByUserId = new Map<string, Promise<void>>();
   private readonly deliveryClient: LarkDeliveryClient;
+  private readonly agentCache = new Map<string, string>();
 
   private stopped = false;
   private socket: WebSocket | null = null;
@@ -1082,8 +1302,57 @@ export class PaperclipInboxLarkNotifier {
 
   async run() {
     this.installSignalHandlers();
+    await this.fetchAgentCache();
     await this.refreshAllUsers("bootstrap");
     await this.connectLoop();
+  }
+
+  private async fetchAgentCache() {
+    try {
+      const endpoint = new URL(
+        `/api/companies/${encodeURIComponent(this.config.companyId)}/agents`,
+        this.config.apiUrl,
+      );
+
+      const agentListSchema = z.array(
+        z.object({
+          id: z.string(),
+          name: z.string().optional(),
+        }).passthrough(),
+      );
+
+      const agents = await fetchJson(endpoint, agentListSchema, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.config.agentApiKey}`,
+        },
+        timeoutMs: this.config.requestTimeoutMs,
+        retries: this.config.deliveryRetryCount,
+        retryBaseMs: this.config.deliveryRetryBaseMs,
+        retryMaxMs: this.config.deliveryRetryMaxMs,
+      });
+
+      for (const agent of agents) {
+        if (agent.name) {
+          this.agentCache.set(agent.id, agent.name);
+        }
+      }
+
+      this.logger.info({ agentCount: this.agentCache.size }, "loaded agent cache");
+    } catch (err) {
+      this.logger.warn({ err }, "failed to load agent cache, actor names will be unavailable");
+    }
+  }
+
+  private resolveActorName(actorType: string | null | undefined, actorId: string | null | undefined): string | null {
+    if (!actorType) return null;
+    if (actorType === "agent" && actorId) {
+      return this.agentCache.get(actorId) ?? actorId;
+    }
+    if (actorType === "user") {
+      return "用户";
+    }
+    return null;
   }
 
   stop() {
@@ -1199,10 +1468,20 @@ export class PaperclipInboxLarkNotifier {
 
     const action = readPayloadAction(event);
     if (!action) return;
+
+    const previous = readPayloadPrevious(event);
+    const actorType = readEventActorType(event);
+    const actorId = readEventActorId(event);
+
     const refreshContext: RefreshContext = {
       action,
       issueId: readPayloadEntityId(event),
       replySnippet: readPayloadBodySnippet(event),
+      actorType,
+      actorId,
+      actorName: this.resolveActorName(actorType, actorId),
+      previousStatus: previous ? readString(previous.status) : null,
+      previousPriority: previous ? readString(previous.priority) : null,
     };
 
     const userIds = resolveRefreshUserIds(event, Object.keys(this.config.destinationsByUserId));
@@ -1392,6 +1671,9 @@ export class PaperclipInboxLarkNotifier {
       return {
         action: "issue.created",
         issueId: issue.id,
+        actorType: context.actorType,
+        actorId: context.actorId,
+        actorName: context.actorName,
       };
     }
 
@@ -1403,12 +1685,20 @@ export class PaperclipInboxLarkNotifier {
       return {
         action: "issue.updated",
         issueId: issue.id,
+        actorType: context.actorType,
+        actorId: context.actorId,
+        actorName: context.actorName,
+        previousStatus: previousIssue.status !== issue.status ? previousIssue.status : null,
+        previousPriority: previousIssue.priority !== issue.priority ? previousIssue.priority : null,
       };
     }
 
     return {
       action: "issue.comment_added",
       issueId: issue.id,
+      actorType: context.actorType,
+      actorId: context.actorId,
+      actorName: context.actorName,
       replySnippet: await this.resolveReplySnippet(issue, {
         ...context,
         action: "issue.comment_added",

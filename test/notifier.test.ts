@@ -173,23 +173,27 @@ describe("paperclip inbox Lark notifier helpers", () => {
         action: "issue.updated",
         paperclipBaseUrl: "https://paperclip.example.com",
         userId: "user-1",
+        previousStatus: "backlog",
+        actorName: "TestAgent",
       },
     );
 
     expect(card.schema).toBe("2.0");
     // issue.updated falls through to status-driven: done → green
     expect(card.header.template).toBe("green");
-    // header tags: status + priority (no action tag — action is in header title now)
+    // header tags: status + priority
     expect(card.header.text_tag_list.map((tag: { text: { content: string } }) => tag.text.content)).toEqual(["已完成", "高"]);
-    // header title includes identifier and action label
-    expect(card.header.title.content).toContain("SOL-2");
-    expect(card.header.title.content).toContain("更新");
+    // header title is action-based
+    expect(card.header.title.content).toContain("状态更新");
     expect(card.config.summary.content).toContain("SOL-2");
-    // body elements: title, meta_row, divider, actions
+    // body elements: subtitle, title, meta_row (with actor + status change), divider, open_btn
     const elementIds = card.body.elements.map((element: { element_id?: string }) => element.element_id);
+    expect(elementIds).toContain("subtitle");
     expect(elementIds).toContain("title");
     expect(elementIds).toContain("meta_row");
     expect(elementIds).toContain("open_btn");
+    // status tag color for "done" → green
+    expect(card.header.text_tag_list[0]!.color).toBe("green");
   });
 
   it("surfaces reply details for comment-triggered notifications without unread markers", () => {
@@ -204,6 +208,7 @@ describe("paperclip inbox Lark notifier helpers", () => {
         paperclipBaseUrl: "https://paperclip.example.com",
         replySnippet: "已经复现，根因是 token 配错了。",
         userId: "user-2",
+        actorName: "Agent007",
       },
     );
 
@@ -212,12 +217,18 @@ describe("paperclip inbox Lark notifier helpers", () => {
     expect(card.header.text_tag_list.map((tag: { text: { content: string } }) => tag.text.content)).toEqual(["已阻塞", "紧急"]);
     const elementIds = card.body.elements.map((element: { element_id?: string }) => element.element_id);
     // reply element is present for comment_added
+    expect(elementIds).toContain("subtitle");
     expect(elementIds).toContain("title");
     expect(elementIds).toContain("reply");
     expect(elementIds).toContain("meta_row");
+    // comment template has reply button
+    expect(elementIds).toContain("action_row");
 
     const replyBlock = card.body.elements.find((element: { element_id?: string }) => element.element_id === "reply");
     expect((replyBlock as { content?: string })?.content).toContain("已经复现");
+
+    // status tag color for "blocked" → red
+    expect(card.header.text_tag_list[0]!.color).toBe("red");
   });
 
   it("loads notifier config from a config file", () => {

@@ -30,6 +30,12 @@ async function main() {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
+    if (req.method === "GET" && url.pathname === `/api/companies/${COMPANY_ID}/agents`) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify([]));
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/agents/me/inbox/mine") {
       if (req.headers.authorization !== `Bearer ${AGENT_API_KEY}`) {
         res.writeHead(401).end("unauthorized");
@@ -181,12 +187,12 @@ async function main() {
   }
 
   const headerTitle = firstDelivery.card?.header?.title?.content;
-  if (!headerTitle || !headerTitle.includes("SOL-500")) {
+  if (!headerTitle || !headerTitle.includes("Issue")) {
     throw new Error(`Unexpected card header title in smoke delivery: ${headerTitle}`);
   }
 
   const elementIds = firstDelivery.card?.body?.elements?.map((element) => element.element_id) ?? [];
-  if (!elementIds.includes("title") || !elementIds.includes("meta_row")) {
+  if (!elementIds.includes("title") || !elementIds.includes("subtitle")) {
     throw new Error(`Unexpected card body layout in smoke delivery: ${elementIds.join(",")}`);
   }
 
