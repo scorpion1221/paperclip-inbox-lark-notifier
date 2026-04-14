@@ -44,6 +44,14 @@ const liveEventSchema = z.object({
   payload: z.record(z.unknown()),
 });
 
+const issueCommentSchema = z.object({
+  id: z.string().min(1),
+  body: z.string(),
+  createdAt: z.string(),
+});
+
+const issueCommentsResponseSchema = z.array(issueCommentSchema);
+
 const webhookDestinationSchema = z.object({
   type: z.literal("webhook"),
   webhookUrl: z.string().url(),
@@ -73,6 +81,10 @@ const notifierConfigBaseSchema = z.object({
   deliveryRetryCount: z.number().int().min(0).default(3),
   deliveryRetryBaseMs: z.number().int().positive().default(1_000),
   deliveryRetryMaxMs: z.number().int().positive().default(8_000),
+  pollIntervalMs: z.number().int().positive().default(30_000),
+  createdVisibilityRetryCount: z.number().int().min(0).default(6),
+  createdVisibilityRetryBaseMs: z.number().int().positive().default(500),
+  createdVisibilityRetryMaxMs: z.number().int().positive().default(4_000),
 });
 
 const notifierConfigSchema = notifierConfigBaseSchema.superRefine((value, ctx) => {
@@ -101,6 +113,7 @@ const partialNotifierConfigSchema = notifierConfigBaseSchema.partial();
 
 export type RelevantIssueAction = (typeof RELEVANT_ISSUE_ACTIONS)[number];
 export type InboxIssueSummary = z.infer<typeof inboxIssueSchema>;
+export type IssueCommentSummary = z.infer<typeof issueCommentSchema>;
 export type LarkDestination = z.infer<typeof larkDestinationSchema>;
 export type NotifierConfig = z.infer<typeof notifierConfigSchema>;
 export type InboxSnapshot = Map<string, InboxIssueSummary>;
@@ -123,8 +136,30 @@ interface HttpRequestOptions extends RequestInit {
 interface LarkCardContext {
   action: string;
   paperclipBaseUrl: string;
+  replySnippet?: string | null;
   userId: string;
 }
+
+interface RefreshContext {
+  action: string;
+  issueId?: string | null;
+  replySnippet?: string | null;
+}
+
+type LarkHeaderTemplate =
+  | "blue"
+  | "wathet"
+  | "turquoise"
+  | "green"
+  | "yellow"
+  | "orange"
+  | "red"
+  | "carmine"
+  | "violet"
+  | "purple"
+  | "indigo"
+  | "grey"
+  | "default";
 
 class HttpStatusError extends Error {
   status: number;
@@ -147,6 +182,17 @@ function readEnvInt(raw: string | undefined, fallback: number) {
 function readEnvBoolean(raw: string | undefined, fallback = false) {
   if (!raw || raw.trim().length === 0) return fallback;
   return /^(1|true|yes|on)$/i.test(raw.trim());
+}
+
+function readFirstEnvString(env: NodeJS.ProcessEnv, keys: string[]) {
+  for (const key of keys) {
+    const value = env[key]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -231,8 +277,18 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
     dryRun: readEnvBoolean(env.PAPERCLIP_INBOX_LARK_DRY_RUN, configFromFile.dryRun ?? false),
     logLevel: (env.PAPERCLIP_INBOX_LARK_LOG_LEVEL?.trim() || configFromFile.logLevel || "info").toLowerCase(),
     destinationsByUserId,
-    larkAppId: env.PAPERCLIP_INBOX_LARK_APP_ID?.trim() || configFromFile.larkAppId || undefined,
-    larkAppSecret: env.PAPERCLIP_INBOX_LARK_APP_SECRET?.trim() || configFromFile.larkAppSecret || undefined,
+    larkAppId:
+      readFirstEnvString(env, ["PAPERCLIP_INBOX_LARK_APP_ID", "LARK_APP_ID", "FEISHU_APP_ID"]) ||
+      configFromFile.larkAppId ||
+      undefined,
+    larkAppSecret:
+      readFirstEnvString(env, [
+        "PAPERCLIP_INBOX_LARK_APP_SECRET",
+        "LARK_APP_SECRET",
+        "FEISHU_APP_SECRET",
+      ]) ||
+      configFromFile.larkAppSecret ||
+      undefined,
     requestTimeoutMs: readEnvInt(
       env.PAPERCLIP_INBOX_LARK_REQUEST_TIMEOUT_MS,
       configFromFile.requestTimeoutMs ?? 10_000,
@@ -257,6 +313,22 @@ export function loadNotifierConfig(env: NodeJS.ProcessEnv = process.env): Notifi
       env.PAPERCLIP_INBOX_LARK_DELIVERY_RETRY_MAX_MS,
       configFromFile.deliveryRetryMaxMs ?? 8_000,
     ),
+    pollIntervalMs: readEnvInt(
+      env.PAPERCLIP_INBOX_LARK_POLL_INTERVAL_MS,
+      configFromFile.pollIntervalMs ?? 30_000,
+    ),
+    createdVisibilityRetryCount: readEnvInt(
+      env.PAPERCLIP_INBOX_LARK_CREATED_VISIBILITY_RETRY_COUNT,
+      configFromFile.createdVisibilityRetryCount ?? 6,
+    ),
+    createdVisibilityRetryBaseMs: readEnvInt(
+      env.PAPERCLIP_INBOX_LARK_CREATED_VISIBILITY_RETRY_BASE_MS,
+      configFromFile.createdVisibilityRetryBaseMs ?? 500,
+    ),
+    createdVisibilityRetryMaxMs: readEnvInt(
+      env.PAPERCLIP_INBOX_LARK_CREATED_VISIBILITY_RETRY_MAX_MS,
+      configFromFile.createdVisibilityRetryMaxMs ?? 4_000,
+    ),
   });
 }
 
@@ -268,9 +340,18 @@ function readPayloadEntityType(event: LiveEvent) {
   return readString(event.payload.entityType);
 }
 
+function readPayloadEntityId(event: LiveEvent) {
+  return readString(event.payload.entityId);
+}
+
 function readPayloadUserId(event: LiveEvent) {
   const details = isRecord(event.payload.details) ? event.payload.details : null;
   return details ? readString(details.userId) : null;
+}
+
+function readPayloadBodySnippet(event: LiveEvent) {
+  const details = isRecord(event.payload.details) ? event.payload.details : null;
+  return details ? readString(details.bodySnippet) : null;
 }
 
 export function isRelevantActivityEvent(event: LiveEvent) {
@@ -308,6 +389,24 @@ export function diffAddedIssues(previous: InboxSnapshot | null, nextIssues: Inbo
   return nextIssues.filter((issue) => !previous.has(issue.id));
 }
 
+function didIssueSummaryChange(previous: InboxIssueSummary, next: InboxIssueSummary) {
+  return (
+    previous.title !== next.title ||
+    previous.status !== next.status ||
+    previous.priority !== next.priority ||
+    previous.updatedAt !== next.updatedAt ||
+    (previous.lastActivityAt ?? null) !== (next.lastActivityAt ?? null)
+  );
+}
+
+export function diffChangedIssues(previous: InboxSnapshot | null, nextIssues: InboxIssueSummary[]) {
+  if (!previous) return [];
+  return nextIssues.filter((issue) => {
+    const previousIssue = previous.get(issue.id);
+    return previousIssue ? didIssueSummaryChange(previousIssue, issue) : false;
+  });
+}
+
 export function shouldNotifyForAction(action: string) {
   return !LOCAL_INBOX_ACTION_SET.has(action) && action !== "bootstrap";
 }
@@ -316,9 +415,25 @@ export function planIssueNotifications(input: {
   action: string;
   previousSnapshot: InboxSnapshot | null;
   nextIssues: InboxIssueSummary[];
+  targetIssueId?: string | null;
 }) {
   if (!shouldNotifyForAction(input.action)) {
     return [];
+  }
+
+  if (input.targetIssueId) {
+    const matchingIssue = input.nextIssues.find((issue) => issue.id === input.targetIssueId);
+    return matchingIssue ? [matchingIssue] : [];
+  }
+
+  if (input.action === "poll") {
+    const addedIssues = diffAddedIssues(input.previousSnapshot, input.nextIssues);
+    const changedIssues = diffChangedIssues(input.previousSnapshot, input.nextIssues);
+    const deduped = new Map<string, InboxIssueSummary>();
+    for (const issue of [...addedIssues, ...changedIssues]) {
+      deduped.set(issue.id, issue);
+    }
+    return [...deduped.values()];
   }
 
   return diffAddedIssues(input.previousSnapshot, input.nextIssues);
@@ -344,69 +459,336 @@ function buildIssueUrl(baseUrl: string, issue: InboxIssueSummary) {
 function formatTimestamp(value: string | null | undefined) {
   if (!value) return "unknown";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+  return Number.isNaN(date.getTime()) ? value : date.toISOString().replace(".000", "");
 }
 
-function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContext) {
-  const issueUrl = buildIssueUrl(context.paperclipBaseUrl, issue);
-  const lines = [
-    issue.identifier ? `**${issue.identifier}**` : "**Inbox item**",
-    issue.title.replace(/\n+/g, " ").trim(),
-    `Status: ${issue.status}`,
-    `Priority: ${issue.priority}`,
-    issue.isUnreadForMe ? "Unread: yes" : "Unread: no",
-    `Activity: ${formatTimestamp(issue.lastActivityAt ?? issue.updatedAt)}`,
-    `Triggered by: ${context.action}`,
-  ];
+function normalizeCardText(value: string | null | undefined) {
+  return (value ?? "").replace(/\s+/g, " ").trim();
+}
 
-  return {
-    config: {
-      wide_screen_mode: true,
-      enable_forward: true,
+function truncateCardText(value: string | null | undefined, maxLength = 240) {
+  const normalized = normalizeCardText(value);
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function escapeMarkdownText(value: string) {
+  return normalizeCardText(value).replace(/[\\`*_{}\[\]()#+\-.!|>]/g, "\\$&");
+}
+
+function inlineCode(value: string) {
+  return `\`${normalizeCardText(value).replace(/[`\\]/g, "\\$&")}\``;
+}
+
+function humanizeStatus(value: string) {
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "backlog":
+      return "待规划";
+    case "todo":
+      return "待处理";
+    case "in_progress":
+      return "进行中";
+    case "in_review":
+      return "评审中";
+    case "done":
+      return "已完成";
+    case "blocked":
+      return "已阻塞";
+    case "cancelled":
+    case "canceled":
+      return "已取消";
+    default:
+      return normalizeCardText(value).replace(/[_-]+/g, " ");
+  }
+}
+
+function humanizePriority(value: string) {
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "critical":
+      return "紧急";
+    case "high":
+      return "高";
+    case "medium":
+      return "中";
+    case "low":
+      return "低";
+    default:
+      return normalizeCardText(value).replace(/[_-]+/g, " ");
+  }
+}
+
+function humanizeAction(value: string) {
+  switch (value) {
+    case "issue.created":
+      return "新建";
+    case "issue.updated":
+      return "更新";
+    case "issue.comment_added":
+      return "评论";
+    case "issue.read_marked":
+      return "标记已读";
+    case "issue.read_unmarked":
+      return "取消已读";
+    case "issue.inbox_archived":
+      return "归档";
+    case "issue.inbox_unarchived":
+      return "取消归档";
+    default:
+      return normalizeCardText(value).replace(/[._-]+/g, " ");
+  }
+}
+
+function resolveHeaderTemplate(action: string, status: string): LarkHeaderTemplate {
+  // Action-driven: action takes priority for the header color
+  switch (action) {
+    case "issue.created":
+      return "blue";
+    case "issue.comment_added":
+      return "wathet";
+    case "issue.updated":
+      break; // fall through to status-driven
+    default:
+      break;
+  }
+
+  const normalized = status.trim().toLowerCase();
+
+  if (["done", "completed", "complete", "pass", "passed", "approved", "success"].includes(normalized)) {
+    return "green";
+  }
+
+  if (["blocked", "failed", "failure", "error", "rejected"].includes(normalized)) {
+    return "red";
+  }
+
+  if (["in_progress"].includes(normalized)) {
+    return "turquoise";
+  }
+
+  if (["warning", "warn"].includes(normalized)) {
+    return "orange";
+  }
+
+  if (["cancelled", "canceled"].includes(normalized)) {
+    return "grey";
+  }
+
+  if (["in_review", "review"].includes(normalized)) {
+    return "indigo";
+  }
+
+  return "blue";
+}
+
+function resolveActionEmoji(action: string): string {
+  switch (action) {
+    case "issue.created":
+      return "🆕";
+    case "issue.updated":
+      return "✏️";
+    case "issue.comment_added":
+      return "💬";
+    default:
+      return "📋";
+  }
+}
+
+function resolveStatusTagColor(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (["done", "completed", "complete"].includes(normalized)) return "green";
+  if (["in_progress"].includes(normalized)) return "turquoise";
+  if (["in_review", "review"].includes(normalized)) return "purple";
+  if (["blocked", "failed"].includes(normalized)) return "red";
+  if (["cancelled", "canceled"].includes(normalized)) return "neutral";
+  if (["todo"].includes(normalized)) return "blue";
+  return "neutral";
+}
+
+function resolvePriorityTagColor(priority: string): string {
+  const normalized = priority.trim().toLowerCase();
+  if (["critical"].includes(normalized)) return "carmine";
+  if (["high"].includes(normalized)) return "orange";
+  if (["medium"].includes(normalized)) return "blue";
+  if (["low"].includes(normalized)) return "neutral";
+  return "neutral";
+}
+
+function buildCardPreview(issue: InboxIssueSummary) {
+  const parts = [
+    issue.identifier ? normalizeCardText(issue.identifier) : "Inbox item",
+    normalizeCardText(issue.title),
+  ].filter(Boolean);
+
+  return parts.join(" · ").slice(0, 120);
+}
+
+export function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContext) {
+  const issueUrl = buildIssueUrl(context.paperclipBaseUrl, issue);
+  const issueTitle = normalizeCardText(issue.title) || "Untitled issue";
+  const recentActivity = formatTimestamp(issue.lastActivityAt ?? issue.updatedAt);
+  const statusLabel = humanizeStatus(issue.status);
+  const priorityLabel = humanizePriority(issue.priority);
+  const actionLabel = humanizeAction(context.action);
+  const replySnippet = truncateCardText(context.replySnippet);
+  const identifierText = issue.identifier ? normalizeCardText(issue.identifier) : null;
+
+  // --- Header ---
+  const emoji = resolveActionEmoji(context.action);
+  const headerTitle = identifierText
+    ? `${emoji} ${identifierText} · ${actionLabel}`
+    : `${emoji} ${actionLabel}`;
+
+  const header = {
+    template: resolveHeaderTemplate(context.action, issue.status),
+    title: {
+      tag: "plain_text",
+      content: headerTitle,
     },
-    header: {
-      template: issue.isUnreadForMe ? "red" : "blue",
-      title: {
-        tag: "plain_text",
-        content: issue.identifier ? `Paperclip Inbox: ${issue.identifier}` : "Paperclip Inbox",
-      },
-    },
-    elements: [
+    text_tag_list: [
       {
-        tag: "div",
-        text: {
-          tag: "lark_md",
-          content: lines.join("\n"),
-        },
+        tag: "text_tag",
+        text: { tag: "plain_text", content: statusLabel },
+        color: resolveStatusTagColor(issue.status),
       },
-      ...(issueUrl
-        ? [
-            {
-              tag: "action",
-              actions: [
-                {
-                  tag: "button",
-                  type: "primary",
-                  text: {
-                    tag: "plain_text",
-                    content: "Open in Paperclip",
-                  },
-                  url: issueUrl,
-                },
-              ],
-            },
-          ]
-        : []),
       {
-        tag: "note",
+        tag: "text_tag",
+        text: { tag: "plain_text", content: priorityLabel },
+        color: resolvePriorityTagColor(issue.priority),
+      },
+    ],
+  };
+
+  // --- Body elements ---
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const elements: any[] = [];
+
+  // 1. Issue title as main content
+  elements.push({
+    tag: "markdown",
+    element_id: "title",
+    content: `**${escapeMarkdownText(issueTitle)}**`,
+    text_size: "heading",
+  });
+
+  // 2. Reply snippet for comment_added (quote-style)
+  if (replySnippet) {
+    elements.push({
+      tag: "markdown",
+      element_id: "reply",
+      content: `💬 ${escapeMarkdownText(replySnippet)}`,
+      text_size: "normal",
+    });
+  }
+
+  // 3. Metadata row — column_set with status/priority/time
+  elements.push({
+    tag: "column_set",
+    element_id: "meta_row",
+    flex_mode: "flow",
+    horizontal_spacing: "default",
+    columns: [
+      {
+        tag: "column",
+        width: "auto",
         elements: [
           {
-            tag: "plain_text",
-            content: `Paperclip user: ${context.userId}`,
+            tag: "markdown",
+            content: `<font color='grey'>状态</font>\n${inlineCode(statusLabel)}`,
+            text_size: "notation",
+          },
+        ],
+      },
+      {
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "markdown",
+            content: `<font color='grey'>优先级</font>\n${inlineCode(priorityLabel)}`,
+            text_size: "notation",
+          },
+        ],
+      },
+      {
+        tag: "column",
+        width: "auto",
+        elements: [
+          {
+            tag: "markdown",
+            content: `<font color='grey'>最近活动</font>\n${inlineCode(recentActivity)}`,
+            text_size: "notation",
           },
         ],
       },
     ],
+  });
+
+  // 4. Divider + link button
+  if (issueUrl) {
+    elements.push({ tag: "hr", element_id: "divider" });
+    elements.push({
+      tag: "button",
+      element_id: "open_btn",
+      text: { tag: "plain_text", content: "在 Paperclip 中打开 →" },
+      type: "primary",
+      width: "default",
+      multi_url: {
+        url: issueUrl,
+        pc_url: issueUrl,
+        ios_url: issueUrl,
+        android_url: issueUrl,
+      },
+    });
+  }
+
+  return {
+    schema: "2.0",
+    config: {
+      enable_forward: true,
+      update_multi: true,
+      width_mode: "default",
+      summary: {
+        content: buildCardPreview(issue),
+      },
+    },
+    ...(issueUrl
+      ? {
+          card_link: {
+            url: issueUrl,
+          },
+        }
+      : {}),
+    header,
+    body: {
+      direction: "vertical",
+      padding: "4px 12px 12px 12px",
+      vertical_spacing: "8px",
+      elements,
+    },
+  };
+}
+
+function injectWebhookMention(card: ReturnType<typeof buildIssueCard>, mentionOpenId: string) {
+  return {
+    ...card,
+    body: {
+      ...card.body,
+      elements: card.body.elements.map((element) => {
+        if (!isRecord(element) || element.element_id !== "title" || element.tag !== "markdown") {
+          return element;
+        }
+
+        return {
+          ...element,
+          content: `<at id=${mentionOpenId}></at>\n${String(element.content ?? "")}`.trim(),
+        };
+      }),
+    },
   };
 }
 
@@ -420,6 +802,14 @@ function isTransientError(err: unknown) {
   }
 
   return false;
+}
+
+function readUnexpectedWebSocketStatus(err: unknown) {
+  if (!(err instanceof Error)) return null;
+  const match = err.message.match(/Unexpected server response:\s*(\d{3})/);
+  if (!match) return null;
+  const status = Number.parseInt(match[1] ?? "", 10);
+  return Number.isFinite(status) ? status : null;
 }
 
 async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions): Promise<T> {
@@ -549,16 +939,22 @@ class LarkDeliveryClient {
     this.tokenProvider = new LarkTokenProvider(config);
   }
 
-  async sendIssueCard(userId: string, destination: LarkDestination, issue: InboxIssueSummary, action: string) {
+  async sendIssueCard(
+    userId: string,
+    destination: LarkDestination,
+    issue: InboxIssueSummary,
+    context: RefreshContext,
+  ) {
     const card = buildIssueCard(issue, {
-      action,
+      action: context.action,
       paperclipBaseUrl: this.config.paperclipBaseUrl,
+      replySnippet: context.replySnippet,
       userId,
     });
 
     if (this.config.dryRun) {
       this.logger.info({
-        action,
+        action: context.action,
         dryRun: true,
         issueId: issue.id,
         issueIdentifier: issue.identifier,
@@ -569,25 +965,11 @@ class LarkDeliveryClient {
       return;
     }
 
+    let deliveryMetadata: { messageId?: string; chatId?: string } | null = null;
+
     await withRetry(async () => {
       if (destination.type === "webhook") {
-        const textPrefix = destination.mentionOpenId ? `<at id=${destination.mentionOpenId}></at>\n` : "";
-        const webhookCard = {
-          ...card,
-          elements: card.elements.map((element, index) => {
-            if (index !== 0 || !isRecord(element) || element.tag !== "div" || !isRecord(element.text)) {
-              return element;
-            }
-
-            return {
-              ...element,
-              text: {
-                ...element.text,
-                content: `${textPrefix}${String(element.text.content ?? "")}`.trim(),
-              },
-            };
-          }),
-        };
+        const webhookCard = destination.mentionOpenId ? injectWebhookMention(card, destination.mentionOpenId) : card;
 
         const payload = await fetchJson(destination.webhookUrl, z.any(), {
           method: "POST",
@@ -623,6 +1005,12 @@ class LarkDeliveryClient {
         z.object({
           code: z.number(),
           msg: z.string().optional(),
+          data: z
+            .object({
+              message_id: z.string().optional(),
+              chat_id: z.string().optional(),
+            })
+            .optional(),
         }),
         {
           method: "POST",
@@ -642,6 +1030,11 @@ class LarkDeliveryClient {
       if (payload.code !== 0) {
         throw new Error(`Lark IM delivery failed: ${payload.msg ?? payload.code}`);
       }
+
+      deliveryMetadata = {
+        messageId: payload.data?.message_id,
+        chatId: payload.data?.chat_id,
+      };
     }, {
       retries: this.config.deliveryRetryCount,
       baseDelayMs: this.config.deliveryRetryBaseMs,
@@ -659,12 +1052,13 @@ class LarkDeliveryClient {
     });
 
     this.logger.info({
-      action,
+      action: context.action,
       dryRun: false,
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       userId,
       destinationType: destination.type,
+      ...(deliveryMetadata ?? {}),
     }, "Lark delivery sent");
   }
 }
@@ -726,6 +1120,13 @@ export class PaperclipInboxLarkNotifier {
         await this.connectOnce(attempt > 0 ? "reconnect" : "initial_connect");
         attempt = 0;
       } catch (err) {
+        const wsStatus = readUnexpectedWebSocketStatus(err);
+        if (wsStatus === 401 || wsStatus === 403) {
+          this.logger.warn({ wsStatus, err }, "websocket auth failed, switching to polling mode");
+          await this.pollLoop();
+          return;
+        }
+
         attempt += 1;
         if (this.stopped) {
           return;
@@ -798,6 +1199,11 @@ export class PaperclipInboxLarkNotifier {
 
     const action = readPayloadAction(event);
     if (!action) return;
+    const refreshContext: RefreshContext = {
+      action,
+      issueId: readPayloadEntityId(event),
+      replySnippet: readPayloadBodySnippet(event),
+    };
 
     const userIds = resolveRefreshUserIds(event, Object.keys(this.config.destinationsByUserId));
     this.logger.debug({
@@ -806,35 +1212,53 @@ export class PaperclipInboxLarkNotifier {
       userIds,
     }, "received relevant live event");
 
-    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, action)));
+    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, refreshContext)));
   }
 
   private async refreshAllUsers(action: string) {
     const userIds = Object.keys(this.config.destinationsByUserId);
-    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, action)));
+    await Promise.all(userIds.map((userId) => this.queueUserRefresh(userId, { action })));
   }
 
-  private queueUserRefresh(userId: string, action: string) {
+  private queueUserRefresh(userId: string, context: RefreshContext) {
     const existing = this.refreshChainsByUserId.get(userId) ?? Promise.resolve();
-    const next = existing.catch(() => undefined).then(() => this.refreshUserInbox(userId, action));
+    const next = existing.catch(() => undefined).then(() => this.refreshUserInbox(userId, context));
     this.refreshChainsByUserId.set(userId, next);
     return next;
   }
 
-  private async refreshUserInbox(userId: string, action: string) {
-    const previousSnapshot = this.snapshotsByUserId.get(userId) ?? null;
-    const nextIssues = await this.fetchMineInbox(userId);
-    const nextSnapshot = createInboxSnapshot(nextIssues);
-    this.snapshotsByUserId.set(userId, nextSnapshot);
+  private async pollLoop() {
+    while (!this.stopped) {
+      await sleep(this.config.pollIntervalMs);
+      try {
+        await this.refreshAllUsers("poll");
+      } catch (err) {
+        this.logger.warn({ err }, "poll refresh failed");
+      }
+    }
+  }
 
-    const additions = planIssueNotifications({
-      action,
+  private async refreshUserInbox(userId: string, context: RefreshContext) {
+    const previousSnapshot = this.snapshotsByUserId.get(userId) ?? null;
+    let nextIssues = await this.fetchMineInbox(userId);
+    let nextSnapshot = createInboxSnapshot(nextIssues);
+
+    let additions = planIssueNotifications({
+      action: context.action,
       previousSnapshot,
       nextIssues,
+      targetIssueId: context.issueId,
     });
 
+    if (this.shouldRetryCreatedVisibility(context, additions)) {
+      ({ nextIssues, nextSnapshot, additions } = await this.retryCreatedVisibility(userId, previousSnapshot, context));
+    }
+
+    this.snapshotsByUserId.set(userId, nextSnapshot);
+
     this.logger.info({
-      action,
+      action: context.action,
+      targetIssueId: context.issueId,
       userId,
       inboxSize: nextIssues.length,
       addedIssueIds: additions.map((issue) => issue.id),
@@ -851,7 +1275,8 @@ export class PaperclipInboxLarkNotifier {
     }
 
     for (const issue of additions) {
-      await this.deliveryClient.sendIssueCard(userId, destination, issue, action);
+      const notificationContext = await this.resolveNotificationContext(issue, previousSnapshot, context);
+      await this.deliveryClient.sendIssueCard(userId, destination, issue, notificationContext);
     }
   }
 
@@ -869,5 +1294,125 @@ export class PaperclipInboxLarkNotifier {
       retryBaseMs: this.config.deliveryRetryBaseMs,
       retryMaxMs: this.config.deliveryRetryMaxMs,
     });
+  }
+
+  private async fetchLatestIssueComment(issueId: string) {
+    const endpoint = new URL(`/api/issues/${issueId}/comments`, this.config.apiUrl);
+    endpoint.searchParams.set("order", "desc");
+    endpoint.searchParams.set("limit", "1");
+
+    const comments = await fetchJson(endpoint, issueCommentsResponseSchema, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${this.config.agentApiKey}`,
+      },
+      timeoutMs: this.config.requestTimeoutMs,
+      retries: this.config.deliveryRetryCount,
+      retryBaseMs: this.config.deliveryRetryBaseMs,
+      retryMaxMs: this.config.deliveryRetryMaxMs,
+    });
+
+    return comments[0] ?? null;
+  }
+
+  private async resolveReplySnippet(issue: InboxIssueSummary, context: RefreshContext) {
+    if (context.replySnippet) {
+      return context.replySnippet;
+    }
+
+    if (context.action !== "issue.comment_added") {
+      return null;
+    }
+
+    const latestComment = await this.fetchLatestIssueComment(issue.id);
+    return latestComment ? latestComment.body : null;
+  }
+
+  private shouldRetryCreatedVisibility(context: RefreshContext, additions: InboxIssueSummary[]) {
+    return context.action === "issue.created" && Boolean(context.issueId) && additions.length === 0;
+  }
+
+  private async retryCreatedVisibility(
+    userId: string,
+    previousSnapshot: InboxSnapshot | null,
+    context: RefreshContext,
+  ) {
+    let nextIssues: InboxIssueSummary[] = [];
+    let nextSnapshot: InboxSnapshot = new Map();
+    let additions: InboxIssueSummary[] = [];
+
+    for (let attempt = 1; attempt <= this.config.createdVisibilityRetryCount; attempt += 1) {
+      const delay = Math.min(
+        this.config.createdVisibilityRetryMaxMs,
+        this.config.createdVisibilityRetryBaseMs * 2 ** (attempt - 1),
+      );
+      await sleep(delay);
+      nextIssues = await this.fetchMineInbox(userId);
+      nextSnapshot = createInboxSnapshot(nextIssues);
+      additions = planIssueNotifications({
+        action: context.action,
+        previousSnapshot,
+        nextIssues,
+        targetIssueId: context.issueId,
+      });
+
+      this.logger.info({
+        action: context.action,
+        issueId: context.issueId,
+        attempt,
+        delay,
+        userId,
+        inboxSize: nextIssues.length,
+        visible: context.issueId ? nextSnapshot.has(context.issueId) : false,
+      }, "retrying created issue visibility");
+
+      if (additions.length > 0) {
+        return { nextIssues, nextSnapshot, additions };
+      }
+    }
+
+    return { nextIssues, nextSnapshot, additions };
+  }
+
+  private async resolveNotificationContext(
+    issue: InboxIssueSummary,
+    previousSnapshot: InboxSnapshot | null,
+    context: RefreshContext,
+  ): Promise<RefreshContext> {
+    if (context.action !== "poll") {
+      return {
+        ...context,
+        issueId: context.issueId ?? issue.id,
+        replySnippet: await this.resolveReplySnippet(issue, context),
+      };
+    }
+
+    const previousIssue = previousSnapshot?.get(issue.id) ?? null;
+    if (!previousIssue) {
+      return {
+        action: "issue.created",
+        issueId: issue.id,
+      };
+    }
+
+    if (
+      previousIssue.status !== issue.status ||
+      previousIssue.priority !== issue.priority ||
+      previousIssue.title !== issue.title
+    ) {
+      return {
+        action: "issue.updated",
+        issueId: issue.id,
+      };
+    }
+
+    return {
+      action: "issue.comment_added",
+      issueId: issue.id,
+      replySnippet: await this.resolveReplySnippet(issue, {
+        ...context,
+        action: "issue.comment_added",
+      }),
+    };
   }
 }

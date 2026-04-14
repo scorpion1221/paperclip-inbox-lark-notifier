@@ -5,7 +5,7 @@ Standalone notifier that watches Paperclip live issue activity and sends Lark ca
 It depends only on:
 
 - public Paperclip HTTP and WebSocket APIs
-- Lark webhook or IM APIs
+- Lark webhook or direct Feishu IM APIs
 
 It does not import anything from the Paperclip monorepo.
 
@@ -53,8 +53,8 @@ cp examples/inbox-lark-notifier.config.example.json ./notifier.config.json
 ```sh
 export PAPERCLIP_INBOX_LARK_CONFIG_FILE="$PWD/notifier.config.json"
 export PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY="pcak_..."
-export PAPERCLIP_INBOX_LARK_APP_ID="cli_xxx"
-export PAPERCLIP_INBOX_LARK_APP_SECRET="xxx"
+export FEISHU_APP_ID="cli_xxx"
+export FEISHU_APP_SECRET="xxx"
 ```
 
 4. Start the notifier:
@@ -63,7 +63,13 @@ export PAPERCLIP_INBOX_LARK_APP_SECRET="xxx"
 pnpm start
 ```
 
-Use webhook-only destinations if you want to skip Lark app credentials.
+The notifier accepts all of the following credential env names for direct `open_id` / `chat_id` delivery:
+
+- `PAPERCLIP_INBOX_LARK_APP_ID` / `PAPERCLIP_INBOX_LARK_APP_SECRET`
+- `LARK_APP_ID` / `LARK_APP_SECRET`
+- `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
+
+Use webhook-only destinations if you want to skip app credentials entirely.
 
 ## Config Modes
 
@@ -105,10 +111,18 @@ Environment variables override file values. The main env vars are:
 ## Supported Destination Types
 
 - `webhook`: send an interactive card through a Lark custom bot webhook
-- `open_id`: send through Lark IM API to a user open id
-- `chat_id`: send through Lark IM API to a chat id
+- `open_id`: send through the direct Feishu IM API to a user open id
+- `chat_id`: send through the direct Feishu IM API to a chat id
 
-For `open_id` and `chat_id`, `PAPERCLIP_INBOX_LARK_APP_ID` and `PAPERCLIP_INBOX_LARK_APP_SECRET` are required.
+For `open_id` and `chat_id`, export one of the supported app credential pairs listed above.
+
+The direct-send path follows the same tenant-token + `POST /open-apis/im/v1/messages` flow as the user-provided Feishu example. The notifier now emits a Feishu Card 2.0 payload with:
+
+- a status-colored header
+- a dedicated summary block
+- a reply-detail block for `issue.comment_added` notifications
+- a separate metadata block with compact, scan-friendly labels
+- no read/unread badge noise in the card chrome
 
 ## Smoke Validation
 

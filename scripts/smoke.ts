@@ -23,7 +23,9 @@ const issue: InboxIssueSummary = {
 
 async function main() {
   const deliveries: unknown[] = [];
-  let eventSent = false;
+  const currentIssues: InboxIssueSummary[] = [];
+  let createEventSent = false;
+  let fetchesAfterCreate = 0;
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -40,8 +42,15 @@ async function main() {
         return;
       }
 
+      if (createEventSent && currentIssues.length === 0) {
+        fetchesAfterCreate += 1;
+        if (fetchesAfterCreate >= 2) {
+          currentIssues.push(issue);
+        }
+      }
+
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(eventSent ? [issue] : []));
+      res.end(JSON.stringify(currentIssues));
       return;
     }
 
@@ -80,7 +89,7 @@ async function main() {
 
   wss.on("connection", (ws) => {
     setTimeout(() => {
-      eventSent = true;
+      createEventSent = true;
       const event: LiveEvent = {
         id: 1,
         companyId: COMPANY_ID,
@@ -122,6 +131,10 @@ async function main() {
       deliveryRetryCount: 1,
       deliveryRetryBaseMs: 50,
       deliveryRetryMaxMs: 200,
+      pollIntervalMs: 250,
+      createdVisibilityRetryCount: 3,
+      createdVisibilityRetryBaseMs: 20,
+      createdVisibilityRetryMaxMs: 50,
     },
     pino({ level: "silent" }),
   );
@@ -156,9 +169,25 @@ async function main() {
     throw new Error(`Expected exactly one delivery, received ${deliveries.length}`);
   }
 
-  const firstDelivery = deliveries[0] as { card?: { header?: { title?: { content?: string } }; elements?: unknown[] } };
-  if (firstDelivery.card?.header?.title?.content !== "Paperclip Inbox: SOL-500") {
-    throw new Error("Unexpected card title in smoke delivery");
+  const firstDelivery = deliveries[0] as {
+    card?: {
+      schema?: string;
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ element_id?: string }> };
+    };
+  };
+  if (firstDelivery.card?.schema !== "2.0") {
+    throw new Error("Expected a Card 2.0 payload in smoke delivery");
+  }
+
+  const headerTitle = firstDelivery.card?.header?.title?.content;
+  if (!headerTitle || !headerTitle.includes("SOL-500")) {
+    throw new Error(`Unexpected card header title in smoke delivery: ${headerTitle}`);
+  }
+
+  const elementIds = firstDelivery.card?.body?.elements?.map((element) => element.element_id) ?? [];
+  if (!elementIds.includes("title") || !elementIds.includes("meta_row")) {
+    throw new Error(`Unexpected card body layout in smoke delivery: ${elementIds.join(",")}`);
   }
 
   console.log(`Smoke passed with 1 delivery against ${baseUrl}`);

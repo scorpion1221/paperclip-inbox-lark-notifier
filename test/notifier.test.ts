@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import type { InboxIssueSummary, LiveEvent } from "../src/notifier.js";
 import {
+  buildIssueCard,
   createInboxSnapshot,
   diffAddedIssues,
+  diffChangedIssues,
   isRelevantActivityEvent,
   loadNotifierConfig,
   planIssueNotifications,
@@ -79,6 +81,13 @@ describe("paperclip inbox Lark notifier helpers", () => {
     expect(diffAddedIssues(previous, nextIssues).map((issue) => issue.id)).toEqual(["issue-2"]);
   });
 
+  it("diffs visible inbox issues whose summary fields changed", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", status: "todo", updatedAt: "2026-04-11T00:00:00.000Z" })]);
+    const nextIssues = [makeIssue({ id: "issue-1", status: "done", updatedAt: "2026-04-11T01:00:00.000Z" })];
+
+    expect(diffChangedIssues(previous, nextIssues).map((issue) => issue.id)).toEqual(["issue-1"]);
+  });
+
   it("suppresses notifications for local read/archive actions", () => {
     const previous = createInboxSnapshot([]);
     const nextIssues = [makeIssue({ id: "issue-2", identifier: "SOL-2" })];
@@ -107,6 +116,108 @@ describe("paperclip inbox Lark notifier helpers", () => {
         nextIssues,
       }).map((issue) => issue.id),
     ).toEqual(["issue-2"]);
+  });
+
+  it("notifies the targeted visible issue for shared updates even when it already exists in the inbox", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", identifier: "SOL-1", status: "todo" })]);
+    const nextIssues = [makeIssue({ id: "issue-1", identifier: "SOL-1", status: "done" })];
+
+    expect(
+      planIssueNotifications({
+        action: "issue.updated",
+        previousSnapshot: previous,
+        nextIssues,
+        targetIssueId: "issue-1",
+      }).map((issue) => issue.id),
+    ).toEqual(["issue-1"]);
+  });
+
+  it("skips shared updates when the targeted issue is not visible in the inbox", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", identifier: "SOL-1" })]);
+    const nextIssues = [makeIssue({ id: "issue-1", identifier: "SOL-1" })];
+
+    expect(
+      planIssueNotifications({
+        action: "issue.updated",
+        previousSnapshot: previous,
+        nextIssues,
+        targetIssueId: "issue-2",
+      }),
+    ).toEqual([]);
+  });
+
+  it("poll mode notifies both new issues and visible status changes", () => {
+    const previous = createInboxSnapshot([makeIssue({ id: "issue-1", identifier: "SOL-1", status: "todo" })]);
+    const nextIssues = [
+      makeIssue({ id: "issue-1", identifier: "SOL-1", status: "done", updatedAt: "2026-04-11T01:00:00.000Z" }),
+      makeIssue({ id: "issue-2", identifier: "SOL-2", status: "todo" }),
+    ];
+
+    expect(
+      planIssueNotifications({
+        action: "poll",
+        previousSnapshot: previous,
+        nextIssues,
+      }).map((issue) => issue.id),
+    ).toEqual(["issue-2", "issue-1"]);
+  });
+
+  it("builds a Feishu Card 2.0 payload with title, metadata row, and action button", () => {
+    const card = buildIssueCard(
+      makeIssue({
+        identifier: "SOL-2",
+        status: "done",
+        priority: "high",
+      }),
+      {
+        action: "issue.updated",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        userId: "user-1",
+      },
+    );
+
+    expect(card.schema).toBe("2.0");
+    // issue.updated falls through to status-driven: done → green
+    expect(card.header.template).toBe("green");
+    // header tags: status + priority (no action tag — action is in header title now)
+    expect(card.header.text_tag_list.map((tag: { text: { content: string } }) => tag.text.content)).toEqual(["已完成", "高"]);
+    // header title includes identifier and action label
+    expect(card.header.title.content).toContain("SOL-2");
+    expect(card.header.title.content).toContain("更新");
+    expect(card.config.summary.content).toContain("SOL-2");
+    // body elements: title, meta_row, divider, actions
+    const elementIds = card.body.elements.map((element: { element_id?: string }) => element.element_id);
+    expect(elementIds).toContain("title");
+    expect(elementIds).toContain("meta_row");
+    expect(elementIds).toContain("open_btn");
+  });
+
+  it("surfaces reply details for comment-triggered notifications without unread markers", () => {
+    const card = buildIssueCard(
+      makeIssue({
+        identifier: "SOL-3",
+        status: "blocked",
+        priority: "critical",
+      }),
+      {
+        action: "issue.comment_added",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        replySnippet: "已经复现，根因是 token 配错了。",
+        userId: "user-2",
+      },
+    );
+
+    // comment_added → wathet (action-driven)
+    expect(card.header.template).toBe("wathet");
+    expect(card.header.text_tag_list.map((tag: { text: { content: string } }) => tag.text.content)).toEqual(["已阻塞", "紧急"]);
+    const elementIds = card.body.elements.map((element: { element_id?: string }) => element.element_id);
+    // reply element is present for comment_added
+    expect(elementIds).toContain("title");
+    expect(elementIds).toContain("reply");
+    expect(elementIds).toContain("meta_row");
+
+    const replyBlock = card.body.elements.find((element: { element_id?: string }) => element.element_id === "reply");
+    expect((replyBlock as { content?: string })?.content).toContain("已经复现");
   });
 
   it("loads notifier config from a config file", () => {
@@ -215,5 +326,25 @@ describe("paperclip inbox Lark notifier helpers", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("accepts FEISHU/LARK env aliases for direct IM credentials", () => {
+    const config = loadNotifierConfig({
+      PAPERCLIP_INBOX_NOTIFIER_API_URL: "https://paperclip.example.com",
+      PAPERCLIP_INBOX_NOTIFIER_COMPANY_ID: "company-1",
+      PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY: "pcak_test",
+      PAPERCLIP_INBOX_NOTIFIER_BASE_URL: "https://paperclip.example.com",
+      PAPERCLIP_INBOX_LARK_DESTINATIONS_JSON: JSON.stringify({
+        "user-1": {
+          type: "open_id",
+          receiveId: "ou_test",
+        },
+      }),
+      FEISHU_APP_ID: "cli_feishu",
+      FEISHU_APP_SECRET: "secret_feishu",
+    });
+
+    expect(config.larkAppId).toBe("cli_feishu");
+    expect(config.larkAppSecret).toBe("secret_feishu");
   });
 });
