@@ -134,12 +134,23 @@ pnpm smoke
 
 It starts a local fake Paperclip API and WebSocket server, emits one inbox-visible issue event, and verifies that exactly one Lark webhook card is delivered.
 
+## Acceptance Validation
+
+For the full repeatable acceptance path, run:
+
+```sh
+pnpm acceptance
+```
+
+It uses the same fake Paperclip pattern plus fake Lark endpoints to verify all three card templates (`issue.created`, `issue.updated`, `issue.comment_added`) across both webhook delivery and direct IM delivery.
+
 ## Tests
 
 ```sh
 pnpm typecheck
 pnpm test
 pnpm smoke
+pnpm acceptance
 ```
 
 ## Dry Run
@@ -177,4 +188,5 @@ Example templates:
 - entrypoint: [src/index.ts](./src/index.ts)
 - core logic: [src/notifier.ts](./src/notifier.ts)
 - unit tests: [test/notifier.test.ts](./test/notifier.test.ts)
+- acceptance flow: [scripts/acceptance.ts](./scripts/acceptance.ts)
 - smoke flow: [scripts/smoke.ts](./scripts/smoke.ts)
