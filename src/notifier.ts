@@ -94,6 +94,8 @@ const notifierConfigBaseSchema = z.object({
   deliveryRetryBaseMs: z.number().int().positive().default(1_000),
   deliveryRetryMaxMs: z.number().int().positive().default(8_000),
   pollIntervalMs: z.number().int().positive().default(30_000),
+  pingIntervalMs: z.number().int().positive().default(30_000),
+  pingTimeoutMs: z.number().int().positive().default(10_000),
   createdVisibilityRetryCount: z.number().int().min(0).default(6),
   createdVisibilityRetryBaseMs: z.number().int().positive().default(500),
   createdVisibilityRetryMaxMs: z.number().int().positive().default(4_000),
@@ -1680,6 +1682,15 @@ export class PaperclipInboxLarkNotifier {
 
       await new Promise<void>((resolve, reject) => {
         let opened = false;
+        let pingTimer: ReturnType<typeof setInterval> | undefined;
+        let pongTimer: ReturnType<typeof setTimeout> | undefined;
+        let pongReceived = true;
+
+        const clearTimers = () => {
+          if (pingTimer) { clearInterval(pingTimer); pingTimer = undefined; }
+          if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
+        };
+
         const socket = new WebSocket(wsUrl, {
           headers: {
             Authorization: `Bearer ${company.agentApiKey}`,
@@ -1692,14 +1703,44 @@ export class PaperclipInboxLarkNotifier {
           opened = true;
           companyLogger.info({ connectReason, url: wsUrl.toString() }, "connected to live events websocket");
           void refreshAllUsers(connectReason);
+
+          // Start ping/pong heartbeat
+          pingTimer = setInterval(() => {
+            if (!pongReceived) {
+              companyLogger.warn("pong not received within interval, terminating websocket");
+              clearTimers();
+              socket.terminate();
+              return;
+            }
+            pongReceived = false;
+            socket.ping();
+            pongTimer = setTimeout(() => {
+              if (!pongReceived) {
+                companyLogger.warn(
+                  { timeoutMs: this.config.pingTimeoutMs },
+                  "websocket ping timeout, terminating connection",
+                );
+                clearTimers();
+                socket.terminate();
+              }
+            }, this.config.pingTimeoutMs);
+          }, this.config.pingIntervalMs);
+        });
+
+        socket.on("pong", () => {
+          pongReceived = true;
+          if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
         });
 
         socket.on("message", (raw) => {
+          // Any message counts as proof of liveness
+          pongReceived = true;
           void handleSocketMessage(raw.toString());
         });
 
         socket.on("error", (err) => {
           if (!opened) {
+            clearTimers();
             reject(err);
             return;
           }
@@ -1707,6 +1748,7 @@ export class PaperclipInboxLarkNotifier {
         });
 
         socket.on("close", (code, reason) => {
+          clearTimers();
           const idx = this.sockets.indexOf(socket);
           if (idx >= 0) this.sockets.splice(idx, 1);
           const reasonText = typeof reason === "string" ? reason : reason.toString();

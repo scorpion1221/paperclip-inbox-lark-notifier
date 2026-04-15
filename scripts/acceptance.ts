@@ -378,6 +378,8 @@ async function main() {
       createdVisibilityRetryCount: 3,
       createdVisibilityRetryBaseMs: 20,
       createdVisibilityRetryMaxMs: 50,
+      pingIntervalMs: 30_000,
+      pingTimeoutMs: 10_000,
     },
     pino({ level: "silent" }),
   );

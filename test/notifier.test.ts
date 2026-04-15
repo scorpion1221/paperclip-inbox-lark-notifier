@@ -395,6 +395,8 @@ describe("paperclip inbox Lark notifier helpers", () => {
       createdVisibilityRetryCount: 6,
       createdVisibilityRetryBaseMs: 500,
       createdVisibilityRetryMaxMs: 4_000,
+      pingIntervalMs: 30_000,
+      pingTimeoutMs: 10_000,
     };
 
     const companies = resolveCompanies(config);
@@ -444,6 +446,8 @@ describe("paperclip inbox Lark notifier helpers", () => {
       createdVisibilityRetryCount: 6,
       createdVisibilityRetryBaseMs: 500,
       createdVisibilityRetryMaxMs: 4_000,
+      pingIntervalMs: 30_000,
+      pingTimeoutMs: 10_000,
     };
 
     const companies = resolveCompanies(config);
