@@ -11,6 +11,7 @@ import {
   isRelevantActivityEvent,
   loadNotifierConfig,
   planIssueNotifications,
+  resolveDirectIssueFallback,
   resolveCompanies,
   resolveRefreshUserIds,
   shouldNotifyForAction,
@@ -161,6 +162,63 @@ describe("paperclip inbox Lark notifier helpers", () => {
         nextIssues,
       }).map((issue) => issue.id),
     ).toEqual(["issue-2", "issue-1"]);
+  });
+
+  it("falls back to direct issue fetch and injects the issue into the snapshot", async () => {
+    const nextSnapshot = createInboxSnapshot([]);
+    let requestedIssueId: string | null = null;
+    const fetchIssueById = async (issueId: string) => {
+      requestedIssueId = issueId;
+      return makeIssue({ id: issueId, identifier: "SOL-404" });
+    };
+
+    const result = await resolveDirectIssueFallback({
+      additions: [],
+      nextSnapshot,
+      context: {
+        action: "issue.updated",
+        issueId: "issue-404",
+      },
+      fetchIssueById,
+    });
+
+    expect(requestedIssueId).toBe("issue-404");
+    expect(result.additions.map((issue) => issue.id)).toEqual(["issue-404"]);
+    expect(result.nextSnapshot.get("issue-404")?.identifier).toBe("SOL-404");
+  });
+
+  it("does not use the direct fetch fallback for local inbox actions", async () => {
+    const fetchIssueById = async () => {
+      throw new Error("should not be called");
+    };
+
+    const result = await resolveDirectIssueFallback({
+      additions: [],
+      nextSnapshot: createInboxSnapshot([]),
+      context: {
+        action: "issue.read_marked",
+        issueId: "issue-404",
+      },
+      fetchIssueById,
+    });
+
+    expect(result.additions).toEqual([]);
+    expect(result.nextSnapshot.size).toBe(0);
+  });
+
+  it("gracefully skips notification when the direct fetch fallback returns null", async () => {
+    const result = await resolveDirectIssueFallback({
+      additions: [],
+      nextSnapshot: createInboxSnapshot([]),
+      context: {
+        action: "issue.created",
+        issueId: "issue-404",
+      },
+      fetchIssueById: async () => null,
+    });
+
+    expect(result.additions).toEqual([]);
+    expect(result.nextSnapshot.size).toBe(0);
   });
 
   it("builds a Feishu Card 2.0 payload with title, metadata row, and action button", () => {

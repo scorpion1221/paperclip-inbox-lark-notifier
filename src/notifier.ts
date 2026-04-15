@@ -149,6 +149,33 @@ export type CompanyConfig = z.infer<typeof companyConfigSchema>;
 export type InboxSnapshot = Map<string, InboxIssueSummary>;
 export type LiveEvent = z.infer<typeof liveEventSchema>;
 
+export async function resolveDirectIssueFallback(input: {
+  additions: InboxIssueSummary[];
+  nextSnapshot: InboxSnapshot;
+  context: Pick<RefreshContext, "action" | "issueId">;
+  fetchIssueById: (issueId: string) => Promise<InboxIssueSummary | null>;
+  onResolved?: (issue: InboxIssueSummary) => void;
+}): Promise<{ additions: InboxIssueSummary[]; nextSnapshot: InboxSnapshot }> {
+  const { additions, nextSnapshot, context, fetchIssueById, onResolved } = input;
+
+  if (additions.length > 0 || !context.issueId || !shouldNotifyForAction(context.action)) {
+    return { additions, nextSnapshot };
+  }
+
+  const directIssue = await fetchIssueById(context.issueId);
+  if (!directIssue) {
+    return { additions, nextSnapshot };
+  }
+
+  nextSnapshot.set(directIssue.id, directIssue);
+  onResolved?.(directIssue);
+
+  return {
+    additions: [directIssue],
+    nextSnapshot,
+  };
+}
+
 export function resolveCompanies(config: NotifierConfig): CompanyConfig[] {
   if (config.companies && config.companies.length > 0) {
     return config.companies.map((company) => ({
@@ -1442,6 +1469,38 @@ export class PaperclipInboxLarkNotifier {
       });
     };
 
+    const fetchIssueById = async (issueId: string): Promise<InboxIssueSummary | null> => {
+      const endpoint = new URL(`/api/issues/${encodeURIComponent(issueId)}`, this.config.apiUrl);
+
+      try {
+        const raw = await fetchJson(endpoint, z.record(z.unknown()), {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${company.agentApiKey}`,
+          },
+          timeoutMs: this.config.requestTimeoutMs,
+          retries: 1,
+          retryBaseMs: this.config.deliveryRetryBaseMs,
+          retryMaxMs: this.config.deliveryRetryMaxMs,
+        });
+
+        const parsed = inboxIssueSchema.safeParse({
+          id: raw.id,
+          identifier: raw.identifier ?? null,
+          title: raw.title ?? "Untitled",
+          status: raw.status ?? "backlog",
+          priority: raw.priority ?? "medium",
+          updatedAt: raw.updatedAt ?? new Date().toISOString(),
+          lastActivityAt: raw.lastActivityAt ?? null,
+        });
+
+        return parsed.success ? parsed.data : null;
+      } catch {
+        companyLogger.warn({ issueId }, "fetchIssueById fallback failed");
+        return null;
+      }
+    };
+
     const fetchLatestIssueComment = async (issueId: string) => {
       const endpoint = new URL(`/api/issues/${issueId}/comments`, this.config.apiUrl);
       endpoint.searchParams.set("order", "desc");
@@ -1590,6 +1649,20 @@ export class PaperclipInboxLarkNotifier {
       if (shouldRetryCreatedVisibility(context, additions)) {
         ({ nextIssues, nextSnapshot, additions } = await retryCreatedVisibility(userId, previousSnapshot, context));
       }
+
+      ({ additions, nextSnapshot } = await resolveDirectIssueFallback({
+        additions,
+        nextSnapshot,
+        context,
+        fetchIssueById,
+        onResolved: (directIssue) => {
+          companyLogger.info({
+            action: context.action,
+            issueId: context.issueId,
+            identifier: directIssue.identifier,
+          }, "resolved issue via direct fetch fallback");
+        },
+      }));
 
       snapshotsByUserId.set(userId, nextSnapshot);
 
