@@ -2,6 +2,8 @@
 
 Standalone notifier that watches Paperclip live issue activity and sends Lark cards when a configured board user's Mine inbox gains a newly visible issue.
 
+> Production-friendly Paperclip → Feishu/Lark notifier with webhook and direct IM delivery, multi-company support, retrying websocket reconnects, and self-hosted launchd/systemd templates.
+
 It depends only on:
 
 - public Paperclip HTTP and WebSocket APIs
@@ -180,6 +182,50 @@ Example templates:
 For macOS `launchd`, prefer running the wrapper script instead of invoking `pnpm start`
 directly from the plist. GUI launch agents often start with a minimal `PATH`, which can
 make `pnpm` fail with `env: node: No such file or directory` when Node is managed by nvm.
+
+## Production Runtime Layout
+
+For a long-lived local deployment, a practical runtime layout is:
+
+```text
+~/.config/paperclip-inbox-lark-notifier/
+├── config.json         # main notifier config
+├── agent-api-key       # Paperclip agent API key
+├── service.env         # optional launchd/runtime env overrides
+├── stdout.log
+└── stderr.log
+```
+
+Typical launchd wrapper behavior:
+
+- defaults `PAPERCLIP_INBOX_LARK_CONFIG_FILE` to `~/.config/paperclip-inbox-lark-notifier/config.json`
+- reads `agent-api-key` if `PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY` is not already exported
+- reads optional app credentials from env vars or helper files before starting `pnpm start`
+
+Effective config precedence:
+
+1. explicit environment variables
+2. `PAPERCLIP_INBOX_LARK_CONFIG_FILE`
+3. code defaults
+
+This makes it easy to keep non-secret JSON config on disk while sourcing secrets from
+your shell, launchd, or secret manager.
+
+## Operating the Service
+
+Useful commands for a macOS `launchd` deployment:
+
+```sh
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.paperclip.inbox-lark-notifier
+
+# Inspect status
+launchctl print gui/$(id -u)/com.paperclip.inbox-lark-notifier | head -40
+
+# Tail logs
+tail -f ~/.config/paperclip-inbox-lark-notifier/stdout.log
+tail -f ~/.config/paperclip-inbox-lark-notifier/stderr.log
+```
 
 ## Notification Semantics
 
