@@ -595,6 +595,10 @@ function escapeMarkdownText(value: string) {
   return normalizeCardText(value).replace(/[\\`*_{}\[\]()#+\-.!|>]/g, "\\$&");
 }
 
+function escapeMarkdownLinkText(value: string) {
+  return normalizeCardText(value).replace(/[\\\[\]]/g, "\\$&");
+}
+
 function inlineCode(value: string) {
   return `\`${normalizeCardText(value).replace(/[`\\]/g, "\\$&")}\``;
 }
@@ -832,7 +836,7 @@ export function buildIssueCard(issue: InboxIssueSummary, context: LarkCardContex
 
   // Issue title as heading with link
   const titleContent = issueUrl
-    ? `**[${escapeMarkdownText(issueTitle)}](${issueUrl})**`
+    ? `**[${escapeMarkdownLinkText(issueTitle)}](${issueUrl})**`
     : `**${escapeMarkdownText(issueTitle)}**`;
   elements.push({
     tag: "markdown",

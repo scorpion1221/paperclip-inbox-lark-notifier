@@ -290,6 +290,30 @@ describe("paperclip inbox Lark notifier helpers", () => {
     expect(card.header.text_tag_list[0]!.color).toBe("red");
   });
 
+  it("does not over-escape common punctuation in linked issue titles", () => {
+    const card = buildIssueCard(
+      makeIssue({
+        identifier: "SUP-44",
+        title: "USI-004: Recall Loading in ThinkingBlock (Surface AI)",
+        status: "in_review",
+        priority: "high",
+      }),
+      {
+        action: "issue.updated",
+        paperclipBaseUrl: "https://paperclip.example.com",
+        userId: "user-1",
+      },
+    );
+
+    const titleBlock = card.body.elements.find((element: { element_id?: string }) => element.element_id === "title");
+    const content = (titleBlock as { content?: string } | undefined)?.content ?? "";
+
+    expect(content).toContain("USI-004: Recall Loading in ThinkingBlock (Surface AI)");
+    expect(content).not.toContain("USI\\-004");
+    expect(content).not.toContain("\\(");
+    expect(content).not.toContain("\\)");
+  });
+
   it("loads notifier config from a config file", () => {
     const dir = mkdtempSync(join(tmpdir(), "paperclip-inbox-lark-config-"));
     const configPath = join(dir, "config.json");
