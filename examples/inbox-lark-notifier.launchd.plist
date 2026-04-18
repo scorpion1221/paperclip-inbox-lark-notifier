@@ -10,13 +10,14 @@
 
     <key>ProgramArguments</key>
     <array>
-      <string>/usr/bin/env</string>
-      <string>pnpm</string>
-      <string>start</string>
+      <string>/bin/bash</string>
+      <string>/ABS/PATH/TO/paperclip-inbox-lark-notifier/examples/run-notifier.example.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
+      <key>BASE_DIR</key>
+      <string>/ABS/PATH/TO/paperclip-inbox-lark-notifier/.runtime</string>
       <key>PAPERCLIP_INBOX_LARK_CONFIG_FILE</key>
       <string>/ABS/PATH/TO/paperclip-inbox-lark-notifier/examples/inbox-lark-notifier.config.example.json</string>
       <key>PAPERCLIP_INBOX_NOTIFIER_AGENT_API_KEY</key>

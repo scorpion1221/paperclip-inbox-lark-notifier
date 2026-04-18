@@ -177,6 +177,10 @@ Example templates:
 - [systemd template](./examples/inbox-lark-notifier.systemd.service)
 - [shell wrapper](./examples/run-notifier.example.sh)
 
+For macOS `launchd`, prefer running the wrapper script instead of invoking `pnpm start`
+directly from the plist. GUI launch agents often start with a minimal `PATH`, which can
+make `pnpm` fail with `env: node: No such file or directory` when Node is managed by nvm.
+
 ## Notification Semantics
 
 - bootstrap and reconnect refreshes update local snapshots without sending historical notifications
